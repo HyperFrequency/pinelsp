@@ -106,6 +106,8 @@
 		"test:watch": "vitest",
 		"test:ui": "vitest --ui",
 		"test:coverage": "vitest run --coverage",
+		"test:parser-ts": "node packages/parser-ts/test/smoke.mjs",
+		"build:grammar": "bash scripts/build-grammar.sh",
 		"package": "pnpm run clean && pnpm run build:prod && pnpm exec vsce package --no-dependencies --out dist/",
 		"rebuild": "pnpm run clean && pnpm run build:prod && pnpm run build:tsc && pnpm test && pnpm run package",
 		"rebuild:skip-tests": "pnpm run clean && pnpm run build:prod && pnpm run package",
@@ -148,6 +150,7 @@
 		"vscode-languageclient": "^9.0.1",
 		"vscode-languageserver": "^9.0.1",
 		"vscode-languageserver-textdocument": "^1.0.12",
+		"web-tree-sitter": "^0.26.8",
 		"zod": "^4.3.5"
 	}
 }

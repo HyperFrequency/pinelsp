@@ -1,0 +1,15 @@
+[
+ (function_declaration_statement)
+ (type_definition_statement)
+ (enum_declaration)
+ (if_statement)
+ (for_statement)
+ (switch_statement)
+ (while_statement)
+ (string)
+ (block)
+ (variable_definition)
+ (variable_definition_statement)
+ (tuple_declaration)
+ (tuple_declaration_statement)
+ ] @fold

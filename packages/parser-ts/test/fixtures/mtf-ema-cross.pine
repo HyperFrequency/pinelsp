@@ -1,0 +1,12 @@
+//@version=6
+indicator("MTF EMA Cross", overlay=true)
+
+fast = ta.ema(close, 12)
+slow = ta.ema(close, 26)
+cross_up = ta.crossover(fast, slow)
+cross_dn = ta.crossunder(fast, slow)
+
+plot(fast, color=color.lime)
+plot(slow, color=color.red)
+plotshape(cross_up, style=shape.triangleup, location=location.belowbar, color=color.green)
+plotshape(cross_dn, style=shape.triangledown, location=location.abovebar, color=color.red)
