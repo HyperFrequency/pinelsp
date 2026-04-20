@@ -2,23 +2,16 @@
 // Loads the compiled grammar (packages/tree-sitter-pine/tree-sitter-pine.wasm)
 // and exposes an incremental-parse API.
 
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { type Edit, Language, Parser, type Tree } from "web-tree-sitter";
 
 export interface TreeSitterPineParserOptions {
-	/** Absolute path to `tree-sitter-pine.wasm`. Defaults to the WASM
-	 *  bundled next to this package at `packages/tree-sitter-pine/`. */
-	wasmPath?: string;
+	/** Absolute path to `tree-sitter-pine.wasm`. Required — callers
+	 *  resolve via `require.resolve("@pine-lsp/tree-sitter-pine/tree-sitter-pine.wasm")`
+	 *  under CJS or `import.meta.resolve(...)` under ESM. A default
+	 *  computed from module location would require `import.meta.url`,
+	 *  which is incompatible with this monorepo's CommonJS tsc target. */
+	wasmPath: string;
 }
-
-const DEFAULT_WASM_PATH = path.resolve(
-	path.dirname(fileURLToPath(import.meta.url)),
-	"..",
-	"..",
-	"tree-sitter-pine",
-	"tree-sitter-pine.wasm",
-);
 
 export class TreeSitterPineParser {
 	private readonly parser: Parser;
@@ -28,12 +21,11 @@ export class TreeSitterPineParser {
 	}
 
 	static async create(
-		options?: TreeSitterPineParserOptions,
+		options: TreeSitterPineParserOptions,
 	): Promise<TreeSitterPineParser> {
 		await Parser.init();
 		const parser = new Parser();
-		const wasmPath = options?.wasmPath ?? DEFAULT_WASM_PATH;
-		const language = await Language.load(wasmPath);
+		const language = await Language.load(options.wasmPath);
 		parser.setLanguage(language);
 		return new TreeSitterPineParser(parser);
 	}
