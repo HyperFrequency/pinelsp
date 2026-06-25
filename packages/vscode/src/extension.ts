@@ -32,23 +32,37 @@ export async function deactivate() {
 function createLanguageClient(
 	context: vscode.ExtensionContext,
 ): LanguageClient {
-	// Path to the LSP server
-	const serverModule = context.asAbsolutePath(
-		path.join("dist", "packages", "lsp", "bin", "pine-lsp.js"),
-	);
+	// Opt-in: when `pine.rustServerPath` points at the Rust `pine-lsp` binary,
+	// launch it over stdio instead of the bundled TypeScript server. Left empty
+	// the TS server (default) runs, so this never regresses existing users.
+	const rustServerPath = vscode.workspace
+		.getConfiguration()
+		.get<string>("pine.rustServerPath", "")
+		.trim();
 
-	// Server options - run as Node process with stdio
-	const serverOptions: ServerOptions = {
-		run: {
-			module: serverModule,
+	let serverOptions: ServerOptions;
+	if (rustServerPath) {
+		serverOptions = {
+			command: rustServerPath,
 			transport: TransportKind.stdio,
-		},
-		debug: {
-			module: serverModule,
-			transport: TransportKind.stdio,
-			options: { execArgv: ["--nolazy", "--inspect=6009"] },
-		},
-	};
+		};
+	} else {
+		// Path to the bundled TypeScript LSP server.
+		const serverModule = context.asAbsolutePath(
+			path.join("dist", "packages", "lsp", "bin", "pine-lsp.js"),
+		);
+		serverOptions = {
+			run: {
+				module: serverModule,
+				transport: TransportKind.stdio,
+			},
+			debug: {
+				module: serverModule,
+				transport: TransportKind.stdio,
+				options: { execArgv: ["--nolazy", "--inspect=6009"] },
+			},
+		};
+	}
 
 	// Client options
 	const clientOptions: LanguageClientOptions = {

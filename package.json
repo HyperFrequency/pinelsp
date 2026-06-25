@@ -68,6 +68,11 @@
 					"type": "boolean",
 					"default": true,
 					"description": "On activation, ensure files.associations maps *.pine to the pine language."
+				},
+				"pine.rustServerPath": {
+					"type": "string",
+					"default": "",
+					"description": "Optional path to the Rust `pine-lsp` binary. When set, it is launched over stdio instead of the bundled TypeScript server."
 				}
 			}
 		},
