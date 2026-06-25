@@ -61,6 +61,17 @@ fn collect_defs(node: Node, src: &str, out: &mut Vec<SymbolDef>) {
                 push(out, id, src, SymbolKind::Enum);
             }
         }
+        "tuple_declaration" => {
+            let mut cursor = node.walk();
+            for var in node.children_by_field_name("variables", &mut cursor) {
+                push(out, var, src, SymbolKind::Variable);
+            }
+        }
+        "for_in_statement" => {
+            if let Some(id) = node.child_by_field_name("array_element") {
+                push(out, id, src, SymbolKind::Variable);
+            }
+        }
         _ => {}
     }
     let mut cursor = node.walk();
@@ -148,6 +159,18 @@ mod tests {
         // "len" appears at its definition and inside f(len, 2)
         let refs = references(&d, "len");
         assert_eq!(refs.len(), 2, "len defined once + used once");
+    }
+
+    #[test]
+    fn collects_tuple_and_for_in_vars() {
+        let d = Document::parse(
+            "//@version=6\n[a, b] = ta.macd(close, 12, 26)\nfor item in array.new_float()\n    plot(item)\n",
+        )
+        .unwrap();
+        let names: Vec<_> = definitions(&d).into_iter().map(|x| x.name).collect();
+        assert!(names.contains(&"a".to_string()));
+        assert!(names.contains(&"b".to_string()));
+        assert!(names.contains(&"item".to_string()));
     }
 
     #[test]
