@@ -24,6 +24,8 @@ CASES = {
     "type_mismatch": '//@version=6\nindicator("x")\nint a = "hello"\nplot(close)\n',
     "unknown_arg": '//@version=6\nindicator("x")\nplot(close, badparam=1)\n',
     "too_many_args": '//@version=6\nindicator("x")\nx = math.abs(1, 2, 3)\nplot(x)\n',
+    "missing_arg": '//@version=6\nindicator("x")\nx = ta.sma(close)\nplot(x)\n',
+    "na_compare": '//@version=6\nindicator("x")\nb = close == na\nplot(close)\n',
 }
 
 TV_URL = ("https://pine-facade.tradingview.com/pine-facade/translate_light"

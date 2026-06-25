@@ -40,6 +40,7 @@ pub fn analyze(doc: &Document) -> Vec<Diagnostic> {
     check_undefined_identifiers(doc, &mut out);
     check_type_annotations(doc, &mut out);
     check_call_arguments(doc, &mut out);
+    check_na_comparison(doc, &mut out);
     logiclint::check(doc, &mut out);
     out.sort_by_key(|d| (d.start_byte, d.end_byte));
     out
@@ -325,11 +326,13 @@ fn check_one_call(call: Node, src: &str, out: &mut Vec<Diagnostic>) {
     };
 
     let mut positional = 0usize;
+    let mut named_keys: HashSet<&str> = HashSet::new();
     let mut cursor = args.walk();
     for child in args.named_children(&mut cursor) {
         if child.kind() == "keyword_argument" {
             if let Some(key) = child.child_by_field_name("key") {
                 let key_name = &src[key.start_byte()..key.end_byte()];
+                named_keys.insert(key_name);
                 if !param_names.contains(key_name) {
                     out.push(Diagnostic {
                         start_byte: key.start_byte(),
@@ -356,6 +359,61 @@ fn check_one_call(call: Node, src: &str, out: &mut Vec<Diagnostic>) {
                 f.parameters.len()
             ),
         });
+    }
+
+    // Missing required arguments: a required param with no default, not covered
+    // positionally or by name. Skipped for variadics (their arity isn't fixed).
+    if !variadic {
+        for (i, param) in f.parameters.iter().enumerate() {
+            if param.required
+                && param.default.is_none()
+                && positional <= i
+                && !named_keys.contains(param.name.as_str())
+            {
+                out.push(Diagnostic {
+                    start_byte: call.start_byte(),
+                    end_byte: call.end_byte(),
+                    severity: Severity::Error,
+                    code: "missing-argument",
+                    message: format!("Missing required argument `{}` for `{name}`", param.name),
+                });
+            }
+        }
+    }
+}
+
+/// `x == na` / `x != na` always evaluate to na/false — a pitfall; use `na(x)`.
+/// A warning (TradingView accepts the syntax), mirroring the TS checker.
+fn check_na_comparison(doc: &Document, out: &mut Vec<Diagnostic>) {
+    walk_na(doc.root(), doc.text(), out);
+}
+
+fn walk_na(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
+    if node.kind() == "comparison_operation" {
+        let mut op_cursor = node.walk();
+        let is_eq = node
+            .children(&mut op_cursor)
+            .any(|c| matches!(c.kind(), "==" | "!="));
+        let is_na = |field: &str| {
+            node.child_by_field_name(field).is_some_and(|n| {
+                n.kind() == "identifier" && &src[n.start_byte()..n.end_byte()] == "na"
+            })
+        };
+        if is_eq && (is_na("left") || is_na("right")) {
+            // TradingView treats this as an error, not just a lint.
+            out.push(Diagnostic {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                severity: Severity::Error,
+                code: "na-comparison",
+                message: "Cannot compare to `na` directly; use the `na()` function instead"
+                    .to_string(),
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_na(child, src, out);
     }
 }
 
@@ -458,6 +516,25 @@ mod tests {
     fn valid_named_argument_not_flagged() {
         let d = doc("//@version=6\nplot(close, title=\"t\")\n");
         assert!(!analyze(&d).iter().any(|x| x.code == "unknown-argument"));
+    }
+
+    #[test]
+    fn flags_na_comparison() {
+        let d = doc("//@version=6\nb = close == na\nplot(close)\n");
+        assert!(analyze(&d).iter().any(|x| x.code == "na-comparison"));
+    }
+
+    #[test]
+    fn na_function_call_not_flagged() {
+        // na(x) is the correct form — must not be flagged.
+        let d = doc("//@version=6\nb = na(close)\nplot(close)\n");
+        assert!(!analyze(&d).iter().any(|x| x.code == "na-comparison"));
+    }
+
+    #[test]
+    fn complete_call_has_no_missing_argument() {
+        let d = doc("//@version=6\nplot(close)\nx = ta.sma(close, 14)\n");
+        assert!(!analyze(&d).iter().any(|x| x.code == "missing-argument"));
     }
 
     #[test]
