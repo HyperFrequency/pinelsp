@@ -506,6 +506,139 @@ fn inlay_for_call(call: Node, doc: &Document, out: &mut Vec<InlayHint>) {
     }
 }
 
+// Semantic-token legend indices. MUST match `semantic_token_legend()` order.
+const T_FUNCTION: u32 = 1;
+const T_VARIABLE: u32 = 2;
+const T_PARAMETER: u32 = 3;
+const T_TYPE: u32 = 4;
+const T_STRING: u32 = 5;
+const T_NUMBER: u32 = 6;
+const T_COMMENT: u32 = 7;
+const T_NAMESPACE: u32 = 8;
+const T_PROPERTY: u32 = 9;
+const M_DEFAULT_LIBRARY: u32 = 1 << 0;
+const M_DECLARATION: u32 = 1 << 1;
+
+/// The legend advertised by the server; index order is load-bearing (see the
+/// `T_*` constants above).
+pub fn semantic_token_legend() -> SemanticTokensLegend {
+    SemanticTokensLegend {
+        token_types: vec![
+            SemanticTokenType::KEYWORD,
+            SemanticTokenType::FUNCTION,
+            SemanticTokenType::VARIABLE,
+            SemanticTokenType::PARAMETER,
+            SemanticTokenType::TYPE,
+            SemanticTokenType::STRING,
+            SemanticTokenType::NUMBER,
+            SemanticTokenType::COMMENT,
+            SemanticTokenType::NAMESPACE,
+            SemanticTokenType::PROPERTY,
+        ],
+        token_modifiers: vec![
+            SemanticTokenModifier::DEFAULT_LIBRARY,
+            SemanticTokenModifier::DECLARATION,
+        ],
+    }
+}
+
+/// Full-document semantic tokens (delta-encoded per the LSP spec).
+pub fn semantic_tokens(doc: &Document) -> SemanticTokens {
+    let user = user_kind_map(doc);
+    let mut raw: Vec<(u32, u32, u32, u32, u32)> = Vec::new(); // line, char, len, type, mods
+    collect_tokens(doc.root(), doc, &user, &mut raw);
+    raw.sort_by_key(|t| (t.0, t.1));
+
+    let mut data = Vec::with_capacity(raw.len());
+    let (mut prev_line, mut prev_char) = (0u32, 0u32);
+    for (line, character, length, token_type, token_modifiers_bitset) in raw {
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 { character - prev_char } else { character };
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length,
+            token_type,
+            token_modifiers_bitset,
+        });
+        prev_line = line;
+        prev_char = character;
+    }
+    SemanticTokens { result_id: None, data }
+}
+
+fn user_kind_map(doc: &Document) -> std::collections::HashMap<String, DefKind> {
+    let mut map = std::collections::HashMap::new();
+    for d in symbols::definitions(doc) {
+        map.entry(d.name).or_insert(d.kind);
+    }
+    map
+}
+
+fn collect_tokens(
+    node: Node,
+    doc: &Document,
+    user: &std::collections::HashMap<String, DefKind>,
+    out: &mut Vec<(u32, u32, u32, u32, u32)>,
+) {
+    let classified = match node.kind() {
+        "comment" => Some((T_COMMENT, 0)),
+        "string" => Some((T_STRING, 0)),
+        "integer" | "float" => Some((T_NUMBER, 0)),
+        "identifier" => classify_identifier(node, doc.text(), user),
+        _ => None,
+    };
+    if let Some((token_type, mods)) = classified {
+        let (line, character) = doc.position_at(node.start_byte());
+        let length = utf16_len(&doc.text()[node.start_byte()..node.end_byte()]);
+        out.push((line, character, length, token_type, mods));
+        return; // emitted nodes are atomic — don't recurse (keeps tokens non-overlapping)
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_tokens(child, doc, user, out);
+    }
+}
+
+fn classify_identifier(
+    node: Node,
+    src: &str,
+    user: &std::collections::HashMap<String, DefKind>,
+) -> Option<(u32, u32)> {
+    let name = &src[node.start_byte()..node.end_byte()];
+    let parent = node.parent();
+    let is_field = |field: &str| {
+        parent.is_some_and(|p| {
+            p.kind() == "attribute" && p.child_by_field_name(field).is_some_and(|c| c == node)
+        })
+    };
+    if is_field("attribute") {
+        return Some((T_PROPERTY, 0)); // member name in `obj.member`
+    }
+    if builtins::function(name).is_some() {
+        return Some((T_FUNCTION, M_DEFAULT_LIBRARY));
+    }
+    if builtins::variable(name).is_some() || builtins::constant(name).is_some() {
+        return Some((T_VARIABLE, M_DEFAULT_LIBRARY));
+    }
+    if let Some(kind) = user.get(name) {
+        return Some(match kind {
+            DefKind::Function => (T_FUNCTION, M_DECLARATION),
+            DefKind::Parameter => (T_PARAMETER, 0),
+            DefKind::Type | DefKind::Enum => (T_TYPE, 0),
+            DefKind::Variable => (T_VARIABLE, 0),
+        });
+    }
+    if is_field("object") {
+        return Some((T_NAMESPACE, 0)); // e.g. `ta` in `ta.sma`
+    }
+    None
+}
+
+fn utf16_len(s: &str) -> u32 {
+    s.chars().map(|c| c.len_utf16() as u32).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +733,20 @@ mod tests {
     fn folding_for_multiline_function() {
         let d = doc("//@version=6\nf(x) =>\n    a = x + 1\n    a * 2\nplot(f(close))\n");
         assert!(!folding_ranges(&d).is_empty(), "function body should fold");
+    }
+
+    #[test]
+    fn semantic_tokens_classify_builtins_and_literals() {
+        let d = doc("//@version=6\nx = ta.sma(close, 14)\nplot(x)\n");
+        let toks = semantic_tokens(&d);
+        assert!(!toks.data.is_empty());
+        let types: Vec<u32> = toks.data.iter().map(|t| t.token_type).collect();
+        assert!(types.contains(&T_FUNCTION), "plot → function");
+        assert!(types.contains(&T_NUMBER), "14 → number");
+        assert!(types.contains(&T_NAMESPACE), "ta → namespace");
+        assert!(types.contains(&T_COMMENT), "//@version → comment");
+        // close is a builtin variable → defaultLibrary modifier present somewhere
+        assert!(toks.data.iter().any(|t| t.token_modifiers_bitset & M_DEFAULT_LIBRARY != 0));
     }
 
     #[test]

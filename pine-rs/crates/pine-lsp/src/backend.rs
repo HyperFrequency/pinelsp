@@ -69,6 +69,14 @@ impl LanguageServer for Backend {
                 })),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                        legend: features::semantic_token_legend(),
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                        range: None,
+                        work_done_progress_options: Default::default(),
+                    }),
+                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -241,5 +249,16 @@ impl LanguageServer for Backend {
         Ok(text
             .and_then(Document::parse)
             .map(|d| features::inlay_hints(&d)))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        let text = self.docs.lock().await.get(&uri).cloned();
+        Ok(text
+            .and_then(Document::parse)
+            .map(|d| SemanticTokensResult::Tokens(features::semantic_tokens(&d))))
     }
 }
