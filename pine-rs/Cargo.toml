@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tree-sitter-pine", "crates/pine-core", "crates/pine-data-codegen"]
+members = ["crates/tree-sitter-pine", "crates/pine-core", "crates/pine-data-codegen", "crates/pine-lsp"]
 
 # Shared metadata + dependency versions for the Pine Rust toolchain.
 # Crates added in later phases (pine-data-codegen, pine-check, pine-lsp,
@@ -12,6 +12,9 @@ license = "MIT"
 [workspace.dependencies]
 tree-sitter = "0.26"
 tree-sitter-pine = { path = "crates/tree-sitter-pine" }
+pine-core = { path = "crates/pine-core" }
 pine-data-codegen = { path = "crates/pine-data-codegen" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "sync"] }

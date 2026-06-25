@@ -1,0 +1,16 @@
+[package]
+name = "pine-lsp"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Pine Script v6 language server (tower-lsp)"
+
+[[bin]]
+name = "pine-lsp"
+path = "src/main.rs"
+
+[dependencies]
+pine-core.workspace = true
+tree-sitter.workspace = true
+tower-lsp.workspace = true
+tokio.workspace = true
