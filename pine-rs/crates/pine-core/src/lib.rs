@@ -6,7 +6,9 @@
 //! phases; for now a `Document` is a full parse of its source text.
 
 pub mod builtins;
+pub mod text;
 
+use text::LineIndex;
 use tree_sitter::{Node, Parser, Tree};
 
 /// A parsed Pine Script document: the source text plus its tree-sitter tree.
@@ -16,6 +18,7 @@ use tree_sitter::{Node, Parser, Tree};
 pub struct Document {
     text: String,
     tree: Tree,
+    line_index: LineIndex,
 }
 
 impl Document {
@@ -30,12 +33,32 @@ impl Document {
         let mut parser = Parser::new();
         parser.set_language(&tree_sitter_pine::language()).ok()?;
         let tree = parser.parse(text.as_str(), None)?;
-        Some(Self { text, tree })
+        let line_index = LineIndex::new(&text);
+        Some(Self {
+            text,
+            tree,
+            line_index,
+        })
     }
 
     /// The source text this document was parsed from.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// UTF-16-aware byte/position mapping for this document's text.
+    pub fn line_index(&self) -> &LineIndex {
+        &self.line_index
+    }
+
+    /// LSP position (0-based line, UTF-16 char) -> byte offset.
+    pub fn offset_at(&self, line: u32, character_utf16: u32) -> usize {
+        self.line_index.offset_at(&self.text, line, character_utf16)
+    }
+
+    /// Byte offset -> LSP position (0-based line, UTF-16 char).
+    pub fn position_at(&self, offset: usize) -> (u32, u32) {
+        self.line_index.position_at(&self.text, offset)
     }
 
     /// The underlying tree-sitter syntax tree.
