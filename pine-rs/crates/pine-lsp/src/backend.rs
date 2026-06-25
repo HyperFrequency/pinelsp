@@ -54,6 +54,19 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: None,
+                    work_done_progress_options: Default::default(),
+                }),
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
                 ..Default::default()
             },
             ..Default::default()
@@ -112,5 +125,100 @@ impl LanguageServer for Backend {
             .map(|d| features::completions_at(&d, pos))
             .unwrap_or_default();
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let text = self.docs.lock().await.get(&uri).cloned();
+        Ok(text
+            .and_then(Document::parse)
+            .and_then(|d| features::signature_help(&d, pos)))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri.clone();
+        let pos = params.text_document_position_params.position;
+        let text = self.docs.lock().await.get(&uri).cloned();
+        Ok(text
+            .and_then(Document::parse)
+            .and_then(|d| features::goto_definition(&d, pos, uri)))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri.clone();
+        let pos = params.text_document_position.position;
+        let text = self.docs.lock().await.get(&uri).cloned();
+        Ok(text
+            .and_then(Document::parse)
+            .map(|d| features::references(&d, pos, uri)))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let text = self.docs.lock().await.get(&uri).cloned();
+        Ok(text
+            .and_then(Document::parse)
+            .map(|d| DocumentSymbolResponse::Nested(features::document_symbols(&d))))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let query = params.query.to_lowercase();
+        let docs = self.docs.lock().await;
+        let mut out = Vec::new();
+        for (uri, text) in docs.iter() {
+            let Some(doc) = Document::parse(text.clone()) else {
+                continue;
+            };
+            for sym in features::document_symbols(&doc) {
+                if !query.is_empty() && !sym.name.to_lowercase().contains(&query) {
+                    continue;
+                }
+                #[allow(deprecated)]
+                out.push(SymbolInformation {
+                    name: sym.name,
+                    kind: sym.kind,
+                    tags: None,
+                    deprecated: None,
+                    location: Location {
+                        uri: uri.clone(),
+                        range: sym.range,
+                    },
+                    container_name: None,
+                });
+            }
+        }
+        Ok(Some(out))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let uri = params.text_document.uri;
+        let pos = params.position;
+        let text = self.docs.lock().await.get(&uri).cloned();
+        Ok(text
+            .and_then(Document::parse)
+            .and_then(|d| features::prepare_rename(&d, pos)))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri.clone();
+        let pos = params.text_document_position.position;
+        let new_name = params.new_name;
+        let text = self.docs.lock().await.get(&uri).cloned();
+        Ok(text
+            .and_then(Document::parse)
+            .and_then(|d| features::rename(&d, pos, new_name, uri)))
     }
 }

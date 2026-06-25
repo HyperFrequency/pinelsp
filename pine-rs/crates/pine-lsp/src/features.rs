@@ -3,7 +3,10 @@
 //! Backend. Semantic diagnostics (the ported checker) arrive in P3; here
 //! diagnostics are tree-sitter syntax errors only.
 
+use std::collections::HashMap;
+
 use pine_core::builtins;
+use pine_core::symbols::{self, SymbolKind as DefKind};
 use pine_core::Document;
 use tower_lsp::lsp_types::*;
 use tree_sitter::Node;
@@ -204,6 +207,187 @@ fn trailing_run(text: &str, byte: usize) -> &str {
     &text[start..byte]
 }
 
+/// Byte range -> LSP range via the document's UTF-16 line index.
+fn byte_range(doc: &Document, start: usize, end: usize) -> Range {
+    let (start_line, start_col) = doc.position_at(start);
+    let (end_line, end_col) = doc.position_at(end);
+    Range {
+        start: Position::new(start_line, start_col),
+        end: Position::new(end_line, end_col),
+    }
+}
+
+/// Signature help for the builtin call enclosing the cursor.
+pub fn signature_help(doc: &Document, pos: Position) -> Option<SignatureHelp> {
+    let byte = doc.offset_at(pos.line, pos.character);
+    let (name, active) = enclosing_call(doc, byte)?;
+    let f = builtins::function(&name)?;
+    let label = if f.syntax.is_empty() {
+        f.name.clone()
+    } else {
+        f.syntax.clone()
+    };
+    let parameters: Vec<ParameterInformation> = f
+        .parameters
+        .iter()
+        .map(|p| ParameterInformation {
+            label: ParameterLabel::Simple(p.name.clone()),
+            documentation: (!p.description.is_empty())
+                .then(|| Documentation::String(p.description.clone())),
+        })
+        .collect();
+    let active_parameter = (!parameters.is_empty())
+        .then(|| (active as u32).min(parameters.len() as u32 - 1));
+    Some(SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label,
+            documentation: (!f.description.is_empty())
+                .then(|| Documentation::String(f.description.clone())),
+            parameters: Some(parameters),
+            active_parameter,
+        }],
+        active_signature: Some(0),
+        active_parameter,
+    })
+}
+
+fn enclosing_call(doc: &Document, byte: usize) -> Option<(String, usize)> {
+    let mut node = doc.root().named_descendant_for_byte_range(byte, byte)?;
+    while node.kind() != "call" {
+        node = node.parent()?;
+    }
+    let func = node.child_by_field_name("function")?;
+    let name = dotted_name(func, doc.text())?;
+    let active = node
+        .child_by_field_name("arguments")
+        .map(|args| count_commas_before(args, byte))
+        .unwrap_or(0);
+    Some((name, active))
+}
+
+fn dotted_name(node: Node, src: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(src[node.start_byte()..node.end_byte()].to_string()),
+        "attribute" => {
+            let obj = node.child_by_field_name("object")?;
+            let attr = node.child_by_field_name("attribute")?;
+            Some(format!(
+                "{}.{}",
+                dotted_name(obj, src)?,
+                &src[attr.start_byte()..attr.end_byte()]
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn count_commas_before(arg_list: Node, byte: usize) -> usize {
+    let mut cursor = arg_list.walk();
+    arg_list
+        .children(&mut cursor)
+        .filter(|n| n.kind() == "," && n.start_byte() < byte)
+        .count()
+}
+
+/// Top-level document symbols (functions, variables, types, enums).
+pub fn document_symbols(doc: &Document) -> Vec<DocumentSymbol> {
+    symbols::definitions(doc)
+        .into_iter()
+        .filter(|d| d.kind != DefKind::Parameter)
+        .map(|d| {
+            let range = byte_range(doc, d.start_byte, d.end_byte);
+            #[allow(deprecated)]
+            DocumentSymbol {
+                name: d.name,
+                detail: None,
+                kind: to_symbol_kind(d.kind),
+                tags: None,
+                deprecated: None,
+                range,
+                selection_range: range,
+                children: None,
+            }
+        })
+        .collect()
+}
+
+fn to_symbol_kind(kind: DefKind) -> SymbolKind {
+    match kind {
+        DefKind::Function => SymbolKind::FUNCTION,
+        DefKind::Variable | DefKind::Parameter => SymbolKind::VARIABLE,
+        DefKind::Type => SymbolKind::STRUCT,
+        DefKind::Enum => SymbolKind::ENUM,
+    }
+}
+
+/// Go-to-definition for the user symbol under the cursor.
+pub fn goto_definition(doc: &Document, pos: Position, uri: Url) -> Option<GotoDefinitionResponse> {
+    let byte = doc.offset_at(pos.line, pos.character);
+    let (name, _, _) = symbols::identifier_at(doc, byte)?;
+    let def = symbols::definitions(doc).into_iter().find(|d| d.name == name)?;
+    Some(GotoDefinitionResponse::Scalar(Location {
+        uri,
+        range: byte_range(doc, def.start_byte, def.end_byte),
+    }))
+}
+
+/// All references to the user symbol under the cursor.
+pub fn references(doc: &Document, pos: Position, uri: Url) -> Vec<Location> {
+    let byte = doc.offset_at(pos.line, pos.character);
+    let Some((name, _, _)) = symbols::identifier_at(doc, byte) else {
+        return Vec::new();
+    };
+    symbols::references(doc, &name)
+        .into_iter()
+        .map(|(s, e)| Location {
+            uri: uri.clone(),
+            range: byte_range(doc, s, e),
+        })
+        .collect()
+}
+
+/// Rename the user symbol under the cursor (refuses builtins).
+pub fn rename(doc: &Document, pos: Position, new_name: String, uri: Url) -> Option<WorkspaceEdit> {
+    let byte = doc.offset_at(pos.line, pos.character);
+    let (name, _, _) = symbols::identifier_at(doc, byte)?;
+    if is_builtin(&name) {
+        return None;
+    }
+    let edits: Vec<TextEdit> = symbols::references(doc, &name)
+        .into_iter()
+        .map(|(s, e)| TextEdit {
+            range: byte_range(doc, s, e),
+            new_text: new_name.clone(),
+        })
+        .collect();
+    if edits.is_empty() {
+        return None;
+    }
+    let mut changes = HashMap::new();
+    changes.insert(uri, edits);
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    })
+}
+
+/// prepare-rename: allow only on user symbols (not builtins).
+pub fn prepare_rename(doc: &Document, pos: Position) -> Option<PrepareRenameResponse> {
+    let byte = doc.offset_at(pos.line, pos.character);
+    let (name, s, e) = symbols::identifier_at(doc, byte)?;
+    if is_builtin(&name) {
+        return None;
+    }
+    Some(PrepareRenameResponse::Range(byte_range(doc, s, e)))
+}
+
+fn is_builtin(name: &str) -> bool {
+    builtins::function(name).is_some()
+        || builtins::variable(name).is_some()
+        || builtins::constant(name).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +434,47 @@ mod tests {
         assert!(items.iter().any(|i| i.label == "close"));
         assert!(items.iter().any(|i| i.label == "if"));
         assert!(items.len() > 400);
+    }
+
+    #[test]
+    fn signature_help_for_builtin_call() {
+        let d = doc("//@version=6\nx = ta.sma(close, 14)\n");
+        // cursor on the second arg "14" (line 1, char 18)
+        let sh = signature_help(&d, Position::new(1, 18)).expect("sig help for ta.sma");
+        assert_eq!(sh.signatures.len(), 1);
+        assert!(!sh.signatures[0].label.is_empty());
+        assert_eq!(sh.active_parameter, Some(1), "after one comma → param index 1");
+    }
+
+    #[test]
+    fn document_symbols_lists_user_defs() {
+        let d = doc("//@version=6\nlen = 14\nf(a) =>\n    a\n");
+        let names: Vec<String> = document_symbols(&d).into_iter().map(|s| s.name).collect();
+        assert!(names.iter().any(|n| n == "len"));
+        assert!(names.iter().any(|n| n == "f"));
+        assert!(!names.iter().any(|n| n == "a"), "params excluded from doc symbols");
+    }
+
+    #[test]
+    fn definition_references_rename_roundtrip() {
+        let src = "//@version=6\nlen = 14\nz = len + 1\n";
+        let d = doc(src);
+        let uri = Url::parse("file:///t.pine").unwrap();
+        let use_byte = src.rfind("len").unwrap();
+        let (ul, uc) = d.position_at(use_byte);
+        let pos = Position::new(ul, uc);
+
+        assert!(goto_definition(&d, pos, uri.clone()).is_some());
+        assert_eq!(references(&d, pos, uri.clone()).len(), 2);
+
+        let edit = rename(&d, pos, "length".into(), uri.clone()).unwrap();
+        let n = edit.changes.unwrap().values().next().unwrap().len();
+        assert_eq!(n, 2, "rename edits both occurrences");
+    }
+
+    #[test]
+    fn no_rename_on_builtin() {
+        let d = doc("//@version=6\nplot(close)\n");
+        assert!(prepare_rename(&d, Position::new(1, 5)).is_none(), "close is builtin");
     }
 }
