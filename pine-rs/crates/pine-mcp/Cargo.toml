@@ -1,0 +1,15 @@
+[package]
+name = "pine-mcp"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Pine Script v6 MCP server (validate / lookup / list / format)"
+
+[[bin]]
+name = "pine-mcp"
+path = "src/main.rs"
+
+[dependencies]
+pine-core.workspace = true
+pine-check.workspace = true
+serde_json.workspace = true
