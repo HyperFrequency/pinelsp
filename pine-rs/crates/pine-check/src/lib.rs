@@ -13,6 +13,8 @@ use pine_core::symbols::{self, SymbolKind};
 use pine_core::{builtins, Document};
 use tree_sitter::Node;
 
+mod logiclint;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -38,6 +40,7 @@ pub fn analyze(doc: &Document) -> Vec<Diagnostic> {
     check_undefined_identifiers(doc, &mut out);
     check_type_annotations(doc, &mut out);
     check_call_arguments(doc, &mut out);
+    logiclint::check(doc, &mut out);
     out.sort_by_key(|d| (d.start_byte, d.end_byte));
     out
 }
@@ -246,7 +249,7 @@ fn infer_type(node: Node, src: &str) -> Option<String> {
     Some(t.to_string())
 }
 
-fn dotted(node: Node, src: &str) -> Option<String> {
+pub(crate) fn dotted(node: Node, src: &str) -> Option<String> {
     match node.kind() {
         "identifier" => Some(src[node.start_byte()..node.end_byte()].to_string()),
         "attribute" => {
