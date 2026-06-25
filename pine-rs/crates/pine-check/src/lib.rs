@@ -37,6 +37,7 @@ pub fn analyze(doc: &Document) -> Vec<Diagnostic> {
     check_unused_variables(doc, &mut out);
     check_undefined_identifiers(doc, &mut out);
     check_type_annotations(doc, &mut out);
+    check_call_arguments(doc, &mut out);
     out.sort_by_key(|d| (d.start_byte, d.end_byte));
     out
 }
@@ -272,6 +273,89 @@ fn base_of(ty: &str) -> Option<String> {
     Some(base.to_string())
 }
 
+/// Argument validation for calls to *builtin* functions: unknown named
+/// arguments and too many positional arguments. Conservative: only builtins
+/// (user functions skipped), and variadic/overloaded builtins are skipped since
+/// their accepted arguments aren't a fixed set.
+fn check_call_arguments(doc: &Document, out: &mut Vec<Diagnostic>) {
+    if doc.has_errors() {
+        return;
+    }
+    walk_calls(doc.root(), doc.text(), out);
+}
+
+fn walk_calls(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
+    if node.kind() == "call" {
+        check_one_call(node, src, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_calls(child, src, out);
+    }
+}
+
+fn check_one_call(call: Node, src: &str, out: &mut Vec<Diagnostic>) {
+    let Some(func) = call.child_by_field_name("function") else {
+        return;
+    };
+    let Some(name) = dotted(func, src) else {
+        return;
+    };
+    let Some(f) = builtins::function(&name) else {
+        return; // only builtins; user functions need signature inference (later)
+    };
+
+    let variadic = f.flags.as_ref().is_some_and(|fl| fl.variadic);
+    // Overloaded builtins encode alternatives with `unknown`/empty param types;
+    // their accepted argument set isn't fixed, so skip them.
+    let overloaded = f
+        .parameters
+        .iter()
+        .any(|p| p.ty == "unknown" || p.ty.is_empty());
+    if overloaded {
+        return;
+    }
+
+    let param_names: HashSet<&str> = f.parameters.iter().map(|p| p.name.as_str()).collect();
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return;
+    };
+
+    let mut positional = 0usize;
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        if child.kind() == "keyword_argument" {
+            if let Some(key) = child.child_by_field_name("key") {
+                let key_name = &src[key.start_byte()..key.end_byte()];
+                if !param_names.contains(key_name) {
+                    out.push(Diagnostic {
+                        start_byte: key.start_byte(),
+                        end_byte: key.end_byte(),
+                        severity: Severity::Error,
+                        code: "unknown-argument",
+                        message: format!("Unknown argument `{key_name}` for `{name}`"),
+                    });
+                }
+            }
+        } else {
+            positional += 1;
+        }
+    }
+
+    if !variadic && positional > f.parameters.len() {
+        out.push(Diagnostic {
+            start_byte: call.start_byte(),
+            end_byte: call.end_byte(),
+            severity: Severity::Error,
+            code: "too-many-arguments",
+            message: format!(
+                "Too many arguments for `{name}`: expected {}, got {positional}",
+                f.parameters.len()
+            ),
+        });
+    }
+}
+
 fn is_type_mismatch(declared: &str, inferred: &str) -> bool {
     if declared == inferred {
         return false;
@@ -357,6 +441,20 @@ mod tests {
         // close is `series float`; assigning to `float` must not be flagged.
         let d = doc("//@version=6\nfloat c = close\nplot(c)\n");
         assert!(!analyze(&d).iter().any(|x| x.code == "type-mismatch"));
+    }
+
+    #[test]
+    fn flags_unknown_named_argument() {
+        let d = doc("//@version=6\nplot(close, notarealparam=1)\n");
+        assert!(analyze(&d)
+            .iter()
+            .any(|x| x.code == "unknown-argument" && x.message.contains("notarealparam")));
+    }
+
+    #[test]
+    fn valid_named_argument_not_flagged() {
+        let d = doc("//@version=6\nplot(close, title=\"t\")\n");
+        assert!(!analyze(&d).iter().any(|x| x.code == "unknown-argument"));
     }
 
     #[test]
