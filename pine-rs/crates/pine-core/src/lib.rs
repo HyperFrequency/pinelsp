@@ -10,7 +10,11 @@ pub mod symbols;
 pub mod text;
 
 use text::LineIndex;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
+
+fn point((row, column): (usize, usize)) -> Point {
+    Point { row, column }
+}
 
 /// A parsed Pine Script document: the source text plus its tree-sitter tree.
 ///
@@ -62,6 +66,39 @@ impl Document {
         self.line_index.position_at(&self.text, offset)
     }
 
+    /// Apply a single edit — replace the byte range `start_byte..old_end_byte`
+    /// with `new_text` — and **incrementally** reparse, reusing the previous
+    /// tree (tree-sitter reuses unchanged subtrees). Points are byte-based, as
+    /// `InputEdit` requires.
+    pub fn apply_edit(&mut self, start_byte: usize, old_end_byte: usize, new_text: &str) {
+        let start_position = point(self.line_index.byte_to_point(start_byte));
+        let old_end_position = point(self.line_index.byte_to_point(old_end_byte));
+        let new_end_byte = start_byte + new_text.len();
+
+        self.text.replace_range(start_byte..old_end_byte, new_text);
+        let new_index = LineIndex::new(&self.text);
+        let new_end_position = point(new_index.byte_to_point(new_end_byte));
+
+        self.tree.edit(&InputEdit {
+            start_byte,
+            old_end_byte,
+            new_end_byte,
+            start_position,
+            old_end_position,
+            new_end_position,
+        });
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_pine::language())
+            .expect("Pine grammar loads");
+        // Reuse the edited tree for incremental reparse.
+        if let Some(tree) = parser.parse(self.text.as_str(), Some(&self.tree)) {
+            self.tree = tree;
+        }
+        self.line_index = new_index;
+    }
+
     /// The underlying tree-sitter syntax tree.
     pub fn tree(&self) -> &Tree {
         &self.tree
@@ -98,6 +135,33 @@ mod tests {
         parser
             .set_language(&tree_sitter_pine::language())
             .expect("Pine grammar should load");
+    }
+
+    #[test]
+    fn incremental_edit_matches_full_parse() {
+        let mut doc = Document::parse("//@version=6\nx = 1\nplot(x)\n").unwrap();
+        // Replace the `1` in `x = 1` with `42`.
+        let one = doc.text().find("= 1").unwrap() + 2;
+        doc.apply_edit(one, one + 1, "42");
+        assert_eq!(doc.text(), "//@version=6\nx = 42\nplot(x)\n");
+        // The incrementally-reparsed tree must equal a from-scratch parse.
+        let fresh = Document::parse(doc.text()).unwrap();
+        assert_eq!(
+            doc.root().to_sexp(),
+            fresh.root().to_sexp(),
+            "incremental tree must match full parse"
+        );
+        assert!(!doc.has_errors());
+    }
+
+    #[test]
+    fn incremental_edit_multibyte() {
+        // Edit after a multibyte char must keep byte offsets correct.
+        let mut doc = Document::parse("//@version=6\ns = \"😀\"\ny = 1\n").unwrap();
+        let one = doc.text().rfind("= 1").unwrap() + 2;
+        doc.apply_edit(one, one + 1, "2");
+        let fresh = Document::parse(doc.text()).unwrap();
+        assert_eq!(doc.root().to_sexp(), fresh.root().to_sexp());
     }
 
     #[test]

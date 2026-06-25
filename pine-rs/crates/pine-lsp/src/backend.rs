@@ -1,11 +1,6 @@
-//! tower-lsp Backend. P2 wires document sync + diagnostics, hover, and
-//! completion to the pure functions in [`crate::features`]. Definition,
-//! references, rename, and document/workspace symbols are the next P2 increment;
-//! the semantic checker lands in P3.
-//!
-//! Document sync is FULL for now (re-parse per change); true incremental reparse
-//! via tree-sitter `InputEdit` is P6. Parsing is cheap (sub-ms), so the Backend
-//! stores source text and re-parses per request rather than holding a `Tree`.
+//! tower-lsp Backend. Stores a live [`Document`] per open file and applies
+//! INCREMENTAL edits via tree-sitter `InputEdit` (P6), so features read an
+//! already-parsed tree instead of re-parsing per request.
 
 use std::collections::HashMap;
 
@@ -19,8 +14,7 @@ use crate::features;
 
 pub struct Backend {
     client: Client,
-    /// uri -> current source text (FULL sync).
-    docs: Mutex<HashMap<Url, String>>,
+    docs: Mutex<HashMap<Url, Document>>,
 }
 
 impl Backend {
@@ -30,15 +24,6 @@ impl Backend {
             docs: Mutex::new(HashMap::new()),
         }
     }
-
-    async fn refresh(&self, uri: Url, text: &str) {
-        let diagnostics = Document::parse(text)
-            .map(|d| features::all_diagnostics(&d))
-            .unwrap_or_default();
-        self.client
-            .publish_diagnostics(uri, diagnostics, None)
-            .await;
-    }
 }
 
 #[tower_lsp::async_trait]
@@ -47,7 +32,7 @@ impl LanguageServer for Backend {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                    TextDocumentSyncKind::INCREMENTAL,
                 )),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_string()]),
@@ -97,23 +82,48 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        let text = params.text_document.text;
-        self.docs.lock().await.insert(uri.clone(), text.clone());
-        self.refresh(uri, &text).await;
+        let diagnostics = {
+            let mut docs = self.docs.lock().await;
+            let doc = Document::parse(params.text_document.text)
+                .unwrap_or_else(|| Document::parse("").expect("empty doc parses"));
+            let diagnostics = features::all_diagnostics(&doc);
+            docs.insert(uri.clone(), doc);
+            diagnostics
+        };
+        self.client.publish_diagnostics(uri, diagnostics, None).await;
     }
 
-    async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
-        // FULL sync: the final change event carries the whole document.
-        if let Some(change) = params.content_changes.pop() {
-            let uri = params.text_document.uri.clone();
-            self.docs.lock().await.insert(uri.clone(), change.text.clone());
-            self.refresh(uri, &change.text).await;
-        }
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        let diagnostics = {
+            let mut docs = self.docs.lock().await;
+            let Some(doc) = docs.get_mut(&uri) else {
+                return;
+            };
+            for change in params.content_changes {
+                match change.range {
+                    // Incremental edit: convert the UTF-16 LSP range to byte
+                    // offsets *against the current doc*, then splice + reparse.
+                    Some(range) => {
+                        let start = doc.offset_at(range.start.line, range.start.character);
+                        let end = doc.offset_at(range.end.line, range.end.character);
+                        doc.apply_edit(start, end, &change.text);
+                    }
+                    // Whole-document replacement.
+                    None => {
+                        if let Some(fresh) = Document::parse(change.text) {
+                            *doc = fresh;
+                        }
+                    }
+                }
+            }
+            features::all_diagnostics(doc)
+        };
+        self.client.publish_diagnostics(uri, diagnostics, None).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.docs.lock().await.remove(&params.text_document.uri);
-        // Clear diagnostics for the closed file.
         self.client
             .publish_diagnostics(params.text_document.uri, Vec::new(), None)
             .await;
@@ -122,19 +132,17 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .and_then(|d| features::hover_at(&d, pos)))
+        let docs = self.docs.lock().await;
+        Ok(docs.get(&uri).and_then(|d| features::hover_at(d, pos)))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        let items = text
-            .and_then(Document::parse)
-            .map(|d| features::completions_at(&d, pos))
+        let docs = self.docs.lock().await;
+        let items = docs
+            .get(&uri)
+            .map(|d| features::completions_at(d, pos))
             .unwrap_or_default();
         Ok(Some(CompletionResponse::Array(items)))
     }
@@ -142,10 +150,8 @@ impl LanguageServer for Backend {
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .and_then(|d| features::signature_help(&d, pos)))
+        let docs = self.docs.lock().await;
+        Ok(docs.get(&uri).and_then(|d| features::signature_help(d, pos)))
     }
 
     async fn goto_definition(
@@ -154,19 +160,17 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri.clone();
         let pos = params.text_document_position_params.position;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .and_then(|d| features::goto_definition(&d, pos, uri)))
+        let docs = self.docs.lock().await;
+        Ok(docs
+            .get(&uri)
+            .and_then(|d| features::goto_definition(d, pos, uri.clone())))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri.clone();
         let pos = params.text_document_position.position;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .map(|d| features::references(&d, pos, uri)))
+        let docs = self.docs.lock().await;
+        Ok(docs.get(&uri).map(|d| features::references(d, pos, uri.clone())))
     }
 
     async fn document_symbol(
@@ -174,10 +178,10 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .map(|d| DocumentSymbolResponse::Nested(features::document_symbols(&d))))
+        let docs = self.docs.lock().await;
+        Ok(docs
+            .get(&uri)
+            .map(|d| DocumentSymbolResponse::Nested(features::document_symbols(d))))
     }
 
     async fn symbol(
@@ -187,11 +191,8 @@ impl LanguageServer for Backend {
         let query = params.query.to_lowercase();
         let docs = self.docs.lock().await;
         let mut out = Vec::new();
-        for (uri, text) in docs.iter() {
-            let Some(doc) = Document::parse(text.clone()) else {
-                continue;
-            };
-            for sym in features::document_symbols(&doc) {
+        for (uri, doc) in docs.iter() {
+            for sym in features::document_symbols(doc) {
                 if !query.is_empty() && !sym.name.to_lowercase().contains(&query) {
                     continue;
                 }
@@ -218,20 +219,18 @@ impl LanguageServer for Backend {
     ) -> Result<Option<PrepareRenameResponse>> {
         let uri = params.text_document.uri;
         let pos = params.position;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .and_then(|d| features::prepare_rename(&d, pos)))
+        let docs = self.docs.lock().await;
+        Ok(docs.get(&uri).and_then(|d| features::prepare_rename(d, pos)))
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = params.text_document_position.text_document.uri.clone();
         let pos = params.text_document_position.position;
         let new_name = params.new_name;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .and_then(|d| features::rename(&d, pos, new_name, uri)))
+        let docs = self.docs.lock().await;
+        Ok(docs
+            .get(&uri)
+            .and_then(|d| features::rename(d, pos, new_name, uri.clone())))
     }
 
     async fn folding_range(
@@ -239,18 +238,14 @@ impl LanguageServer for Backend {
         params: FoldingRangeParams,
     ) -> Result<Option<Vec<FoldingRange>>> {
         let uri = params.text_document.uri;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .map(|d| features::folding_ranges(&d)))
+        let docs = self.docs.lock().await;
+        Ok(docs.get(&uri).map(|d| features::folding_ranges(d)))
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .map(|d| features::inlay_hints(&d)))
+        let docs = self.docs.lock().await;
+        Ok(docs.get(&uri).map(|d| features::inlay_hints(d)))
     }
 
     async fn semantic_tokens_full(
@@ -258,10 +253,10 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .map(|d| SemanticTokensResult::Tokens(features::semantic_tokens(&d))))
+        let docs = self.docs.lock().await;
+        Ok(docs
+            .get(&uri)
+            .map(|d| SemanticTokensResult::Tokens(features::semantic_tokens(d))))
     }
 
     async fn formatting(
@@ -269,10 +264,8 @@ impl LanguageServer for Backend {
         params: DocumentFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>> {
         let uri = params.text_document.uri;
-        let text = self.docs.lock().await.get(&uri).cloned();
-        Ok(text
-            .and_then(Document::parse)
-            .and_then(|d| features::format_document(&d)))
+        let docs = self.docs.lock().await;
+        Ok(docs.get(&uri).and_then(|d| features::format_document(d)))
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {

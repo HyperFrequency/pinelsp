@@ -73,6 +73,18 @@ impl LineIndex {
     pub fn line_count(&self) -> usize {
         self.line_starts.len()
     }
+
+    /// Byte offset -> tree-sitter point `(row, byte_column)`. NOTE: tree-sitter
+    /// columns are **byte** offsets within the line, not UTF-16 — this is the
+    /// coordinate space for `InputEdit`, distinct from LSP positions.
+    pub fn byte_to_point(&self, byte: usize) -> (usize, usize) {
+        let byte = byte.min(self.len);
+        let row = match self.line_starts.binary_search(&byte) {
+            Ok(r) => r,
+            Err(next) => next - 1,
+        };
+        (row, byte - self.line_starts[row])
+    }
 }
 
 #[cfg(test)]
