@@ -60,6 +60,10 @@
       {
         "type": "true",
         "named": true
+      },
+      {
+        "type": "tuple",
+        "named": true
       }
     ]
   },
@@ -98,6 +102,10 @@
         "named": true
       },
       {
+        "type": "for_in_statement",
+        "named": true
+      },
+      {
         "type": "for_statement",
         "named": true
       },
@@ -115,6 +123,10 @@
       },
       {
         "type": "simple_statement",
+        "named": true
+      },
+      {
+        "type": "simple_statements",
         "named": true
       },
       {
@@ -545,6 +557,52 @@
     }
   },
   {
+    "type": "for_in_statement",
+    "named": true,
+    "fields": {
+      "array_element": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "array_id": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "expression",
+            "named": true
+          }
+        ]
+      },
+      "body": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "block",
+            "named": true
+          }
+        ]
+      },
+      "index": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "for_statement",
     "named": true,
     "fields": {
@@ -749,6 +807,37 @@
         ]
       }
     }
+  },
+  {
+    "type": "import",
+    "named": true,
+    "fields": {
+      "alias": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "path": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "import_path",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "import_path",
+    "named": true,
+    "fields": {}
   },
   {
     "type": "keyword_argument",
@@ -982,6 +1071,10 @@
         "required": true,
         "types": [
           {
+            "type": "for_in_statement",
+            "named": true
+          },
+          {
             "type": "for_statement",
             "named": true
           },
@@ -1033,6 +1126,49 @@
         },
         {
           "type": "expression",
+          "named": true
+        },
+        {
+          "type": "import",
+          "named": true
+        },
+        {
+          "type": "reassignment",
+          "named": true
+        },
+        {
+          "type": "tuple_declaration",
+          "named": true
+        },
+        {
+          "type": "variable_definition",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "simple_statements",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "break",
+          "named": true
+        },
+        {
+          "type": "continue",
+          "named": true
+        },
+        {
+          "type": "expression",
+          "named": true
+        },
+        {
+          "type": "import",
           "named": true
         },
         {
@@ -1238,6 +1374,21 @@
     }
   },
   {
+    "type": "tuple",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "expression",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "tuple_declaration",
     "named": true,
     "fields": {
@@ -1275,6 +1426,10 @@
         "multiple": false,
         "required": true,
         "types": [
+          {
+            "type": "for_in_statement",
+            "named": true
+          },
           {
             "type": "for_statement",
             "named": true
@@ -1468,6 +1623,10 @@
         "multiple": false,
         "required": true,
         "types": [
+          {
+            "type": "for_in_statement",
+            "named": true
+          },
           {
             "type": "for_statement",
             "named": true
@@ -1673,6 +1832,10 @@
     "named": true
   },
   {
+    "type": "as",
+    "named": false
+  },
+  {
     "type": "break",
     "named": true
   },
@@ -1733,8 +1896,21 @@
     "named": false
   },
   {
+    "type": "import",
+    "named": false
+  },
+  {
+    "type": "in",
+    "named": false
+  },
+  {
     "type": "integer",
     "named": true
+  },
+  {
+    "type": "line_continuation",
+    "named": true,
+    "extra": true
   },
   {
     "type": "method",

@@ -17,10 +17,13 @@ module.exports = grammar({
 	extras: $ => [
 		$.comment,
 		/[\s\f\uFEFF\u2060\u200B]|\r?\n/,
+		$.line_continuation,
 	],
 
 	conflicts: $ => [
 		[$.primary_expression, $.base_type],
+		[$.tuple_declaration, $.tuple_declaration_statement, $.primary_expression],
+		[$.tuple_declaration, $.primary_expression],
 		[$._argument_list_with_type_optional, $.primary_expression],
 		[$._argument_list_with_type_optional, $.keyword_argument],
 		[$.primary_expression, $.template_function],
@@ -55,11 +58,21 @@ module.exports = grammar({
 			$.if_statement,
 			$.switch_statement,
 			$.for_statement,
+			$.for_in_statement,
 			$.while_statement,
 			$.variable_definition_statement,
 			$.tuple_declaration_statement,
 			$.reassignment_statement,
+			$.simple_statements,
 			$.simple_statement,
+		),
+		simple_statements: $ => seq(
+			repeat1(seq(
+				$._simple_stmt,
+				','
+			)),
+			optional($._simple_stmt),
+			$._newline
 		),
 		simple_statement: $ => seq(
 			$._simple_stmt,
@@ -72,6 +85,7 @@ module.exports = grammar({
 			$.reassignment,
 			$.break,
 			$.continue,
+			$.import,
 		),
 		if_statement: $ => seq(
 			'if',
@@ -117,6 +131,22 @@ module.exports = grammar({
 			field('body', $._suite),
 
 		),
+		for_in_statement: $ => seq(
+			'for',
+			choice(
+				field('array_element', $.identifier),
+				seq(
+					'[',
+					field('index', $.identifier),
+					',',
+					field('array_element', $.identifier),
+					']'
+				)
+			),
+			'in',
+			field('array_id', $.expression),
+			field('body', $._suite)
+		),
 		while_statement: $ => seq(
 			'while',
 			field('condition', $.expression),
@@ -127,6 +157,7 @@ module.exports = grammar({
 		_structure: $ => choice(
 			$.if_statement,
 			$.for_statement,
+			$.for_in_statement,
 			$.while_statement,
 			$.switch_statement
 		),
@@ -148,7 +179,6 @@ module.exports = grammar({
 			)),
 			$._dedent
 		),
-		// Enum declaration
 		enum_declaration: $ => seq(
 			optional('export'),
 			'enum',
@@ -242,6 +272,21 @@ module.exports = grammar({
 			), ',')),
 			')'
 		),
+		import: $ => seq(
+			'import',
+			field('path', $.import_path),
+			optional(seq(
+				'as',
+				field('alias', $.identifier)
+			)),
+		),
+		import_path: _ => seq(
+			field('username', /[^\/\s]+/),
+			'/',
+			field('export', /[^\/\s]+/),
+			'/',
+			field('version', /[^\/\s]+/)
+		),
 		expression: $ => choice(
 			$.conditional_expression,
 			$.comparison_operation,
@@ -265,6 +310,7 @@ module.exports = grammar({
 			$.integer,
 			$.float,
 			$.string,
+			$.tuple,
 		),
 		template_function: $ => seq(
 			field('name', $.attribute),
@@ -309,6 +355,11 @@ module.exports = grammar({
 			':',
 			field('else_branch', $.expression)
 		)),
+		tuple: $ => seq(
+			'[',
+			sep1($.expression, ','),
+			']'
+		),
 		parenthesized_expression: $ => seq(
 			'(',
 			$.expression,
@@ -373,16 +424,19 @@ module.exports = grammar({
 			'const',
 			'simple'
 		),
-		identifier: _ => /[_A-Za-z][_A-Za-z0-9_]*/,
+		identifier: _ => /[_\p{XID_Start}][_\p{XID_Continue}]*/,
 		integer: _ => token(repeat1(/[0-9]+/)),
 		float: _ => {
-			const digits = repeat1(/[0-9]+/)
+			const digits = repeat1(/[0-9]+_?/)
 			const exponent = seq(/[eE][\+-]?/, digits)
+
 			return token(seq(
 				choice(
-					seq(digits, '.', digits, optional(exponent)),
+					seq(digits, '.', optional(digits), optional(exponent)),
+					seq(optional(digits), '.', digits, optional(exponent)),
 					seq(digits, exponent),
-				)
+				),
+				optional(choice(/[Ll]/, /[jJ]/)),
 			))
 		},
 		color: _ => token(/#[A-Fa-f0-9]{6}|#[A-Fa-f0-9]{8}/),
@@ -410,7 +464,13 @@ module.exports = grammar({
 		),
 		escape_sequence: _ => token(prec(1, seq(
 			'\\',
-			choice('"', '\'', '\\', 'n', 'r', 't')
+			choice(
+				/[^xuU]/,
+				/\d{2,3}/,
+				/x[0-9a-fA-F]{2,}/,
+				/u[0-9a-fA-F]{4}/,
+				/U[0-9a-fA-F]{8}/,
+			)
 		))),
 		_suite: $ => choice(
 			seq($._indent, $.block),
@@ -437,11 +497,23 @@ module.exports = grammar({
 				'param',
 				'returns',
 				'strategy_alert_message',
+				'type',
+				'variable',
+				'version='
 			)
-		)))
+		))),
+		line_continuation: _ => token(seq('\\', choice(seq(optional('\r'), '\n'), '\0')))
 	}
-});
+})
+
+module.exports.PREC = PREC
 
 function sep1(rule, separator) {
-	return seq(rule, repeat(seq(separator, rule)));
+	return seq(
+		rule,
+		repeat(seq(
+			separator,
+			rule
+		))
+	)
 }
