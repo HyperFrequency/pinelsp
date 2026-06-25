@@ -8,3 +8,4 @@ description = "Parsing + document model for the Pine Script Rust toolchain"
 [dependencies]
 tree-sitter.workspace = true
 tree-sitter-pine.workspace = true
+pine-data-codegen.workspace = true

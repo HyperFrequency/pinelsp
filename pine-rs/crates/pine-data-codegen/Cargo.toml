@@ -1,0 +1,10 @@
+[package]
+name = "pine-data-codegen"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Embedded Pine v6 builtins database (functions/variables/constants/keywords)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -5,6 +5,8 @@
 //! true incremental reparse (tree-sitter `InputEdit` reuse) arrive in later
 //! phases; for now a `Document` is a full parse of its source text.
 
+pub mod builtins;
+
 use tree_sitter::{Node, Parser, Tree};
 
 /// A parsed Pine Script document: the source text plus its tree-sitter tree.
