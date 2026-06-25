@@ -414,6 +414,98 @@ fn is_builtin(name: &str) -> bool {
         || builtins::constant(name).is_some()
 }
 
+const FOLDABLE_KINDS: &[&str] = &[
+    "function_declaration_statement",
+    "type_definition_statement",
+    "enum_declaration",
+    "if_statement",
+    "for_statement",
+    "for_in_statement",
+    "switch_statement",
+    "while_statement",
+    "block",
+];
+
+/// Folding ranges for block-like constructs (functions, types, control flow).
+pub fn folding_ranges(doc: &Document) -> Vec<FoldingRange> {
+    let mut out = Vec::new();
+    collect_folds(doc.root(), &mut out);
+    out
+}
+
+fn collect_folds(node: Node, out: &mut Vec<FoldingRange>) {
+    let start = node.start_position();
+    let end = node.end_position();
+    if FOLDABLE_KINDS.contains(&node.kind()) && end.row > start.row {
+        out.push(FoldingRange {
+            start_line: start.row as u32,
+            start_character: None,
+            end_line: end.row as u32,
+            end_character: None,
+            kind: Some(FoldingRangeKind::Region),
+            collapsed_text: None,
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_folds(child, out);
+    }
+}
+
+/// Inlay hints: parameter-name labels on the positional arguments of builtin
+/// calls (e.g. `ta.sma(source: close, length: 14)`).
+pub fn inlay_hints(doc: &Document) -> Vec<InlayHint> {
+    let mut out = Vec::new();
+    collect_inlays(doc.root(), doc, &mut out);
+    out
+}
+
+fn collect_inlays(node: Node, doc: &Document, out: &mut Vec<InlayHint>) {
+    if node.kind() == "call" {
+        inlay_for_call(node, doc, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_inlays(child, doc, out);
+    }
+}
+
+fn inlay_for_call(call: Node, doc: &Document, out: &mut Vec<InlayHint>) {
+    let Some(func) = call.child_by_field_name("function") else {
+        return;
+    };
+    let Some(name) = dotted_name(func, doc.text()) else {
+        return;
+    };
+    let Some(f) = builtins::function(&name) else {
+        return; // builtins only; user-fn params need signature inference (later)
+    };
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    let mut positional = 0usize;
+    for child in args.named_children(&mut cursor) {
+        if child.kind() == "keyword_argument" {
+            continue; // already named at the call site
+        }
+        if let Some(param) = f.parameters.get(positional) {
+            let (line, character) = doc.position_at(child.start_byte());
+            out.push(InlayHint {
+                position: Position::new(line, character),
+                label: InlayHintLabel::String(format!("{}:", param.name)),
+                kind: Some(InlayHintKind::PARAMETER),
+                text_edits: None,
+                tooltip: None,
+                padding_left: None,
+                padding_right: Some(true),
+                data: None,
+            });
+        }
+        positional += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,5 +594,24 @@ mod tests {
     fn no_rename_on_builtin() {
         let d = doc("//@version=6\nplot(close)\n");
         assert!(prepare_rename(&d, Position::new(1, 5)).is_none(), "close is builtin");
+    }
+
+    #[test]
+    fn folding_for_multiline_function() {
+        let d = doc("//@version=6\nf(x) =>\n    a = x + 1\n    a * 2\nplot(f(close))\n");
+        assert!(!folding_ranges(&d).is_empty(), "function body should fold");
+    }
+
+    #[test]
+    fn inlay_hints_label_builtin_args() {
+        let d = doc("//@version=6\nplot(ta.sma(close, 14))\n");
+        let hints = inlay_hints(&d);
+        assert!(!hints.is_empty(), "expected parameter inlay hints");
+        for h in &hints {
+            match &h.label {
+                InlayHintLabel::String(s) => assert!(s.ends_with(':'), "label `{s}`"),
+                _ => panic!("expected string label"),
+            }
+        }
     }
 }

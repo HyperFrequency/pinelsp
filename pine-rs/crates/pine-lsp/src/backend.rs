@@ -67,6 +67,8 @@ impl LanguageServer for Backend {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -220,5 +222,24 @@ impl LanguageServer for Backend {
         Ok(text
             .and_then(Document::parse)
             .and_then(|d| features::rename(&d, pos, new_name, uri)))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
+        let uri = params.text_document.uri;
+        let text = self.docs.lock().await.get(&uri).cloned();
+        Ok(text
+            .and_then(Document::parse)
+            .map(|d| features::folding_ranges(&d)))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let text = self.docs.lock().await.get(&uri).cloned();
+        Ok(text
+            .and_then(Document::parse)
+            .map(|d| features::inlay_hints(&d)))
     }
 }
