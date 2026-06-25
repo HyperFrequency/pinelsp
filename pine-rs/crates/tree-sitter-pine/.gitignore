@@ -5,3 +5,6 @@
 *.so
 *.o
 tree-sitter-pine.pc
+/build/
+*.egg-info/
+__pycache__/
