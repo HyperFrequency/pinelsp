@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/tree-sitter-pine", "crates/pine-core"]
+
+# Shared metadata + dependency versions for the Pine Rust toolchain.
+# Crates added in later phases (pine-data-codegen, pine-check, pine-lsp,
+# pine-mcp, pine-cli) join `members` as they land.
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tree-sitter = "0.26"
+tree-sitter-pine = { path = "crates/tree-sitter-pine" }
