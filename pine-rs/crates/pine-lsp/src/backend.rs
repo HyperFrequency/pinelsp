@@ -69,6 +69,8 @@ impl LanguageServer for Backend {
                 })),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                         legend: features::semantic_token_legend(),
@@ -260,5 +262,21 @@ impl LanguageServer for Backend {
         Ok(text
             .and_then(Document::parse)
             .map(|d| SemanticTokensResult::Tokens(features::semantic_tokens(&d))))
+    }
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let text = self.docs.lock().await.get(&uri).cloned();
+        Ok(text
+            .and_then(Document::parse)
+            .and_then(|d| features::format_document(&d)))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri.clone();
+        Ok(Some(features::code_actions(&params.context.diagnostics, uri)))
     }
 }

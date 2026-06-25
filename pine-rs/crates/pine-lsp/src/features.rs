@@ -639,6 +639,72 @@ fn utf16_len(s: &str) -> u32 {
     s.chars().map(|c| c.len_utf16() as u32).sum()
 }
 
+/// Document formatting — deliberately conservative because Pine's indentation is
+/// significant: trim trailing whitespace per line, drop trailing blank lines,
+/// and guarantee exactly one final newline. No reindentation or operator
+/// spacing (those risk changing semantics). Returns `None` when already clean.
+pub fn format_document(doc: &Document) -> Option<Vec<TextEdit>> {
+    let src = doc.text();
+    let formatted = format_text(src);
+    if formatted == src {
+        return None;
+    }
+    let (end_line, end_char) = doc.position_at(src.len());
+    Some(vec![TextEdit {
+        range: Range {
+            start: Position::new(0, 0),
+            end: Position::new(end_line, end_char),
+        },
+        new_text: formatted,
+    }])
+}
+
+fn format_text(src: &str) -> String {
+    let mut lines: Vec<String> = src.lines().map(|l| l.trim_end().to_string()).collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Quick-fix code actions for diagnostics in range. Currently: add a missing
+/// `//@version=6` directive.
+pub fn code_actions(diagnostics: &[Diagnostic], uri: Url) -> Vec<CodeActionOrCommand> {
+    let mut actions = Vec::new();
+    for diag in diagnostics {
+        if diag.code == Some(NumberOrString::String("missing-version".to_string())) {
+            let mut changes = HashMap::new();
+            changes.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: Range {
+                        start: Position::new(0, 0),
+                        end: Position::new(0, 0),
+                    },
+                    new_text: "//@version=6\n".to_string(),
+                }],
+            );
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Add `//@version=6`".to_string(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diag.clone()]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                ..Default::default()
+            }));
+        }
+    }
+    actions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +799,33 @@ mod tests {
     fn folding_for_multiline_function() {
         let d = doc("//@version=6\nf(x) =>\n    a = x + 1\n    a * 2\nplot(f(close))\n");
         assert!(!folding_ranges(&d).is_empty(), "function body should fold");
+    }
+
+    #[test]
+    fn format_trims_and_normalizes() {
+        let d = doc("//@version=6  \nplot(close)   \n\n\n");
+        let edits = format_document(&d).expect("should reformat");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "//@version=6\nplot(close)\n");
+    }
+
+    #[test]
+    fn format_noop_when_clean() {
+        let d = doc("//@version=6\nplot(close)\n");
+        assert!(format_document(&d).is_none());
+    }
+
+    #[test]
+    fn code_action_adds_version() {
+        let uri = Url::parse("file:///t.pine").unwrap();
+        let diag = Diagnostic {
+            range: Range::default(),
+            code: Some(NumberOrString::String("missing-version".to_string())),
+            message: String::new(),
+            ..Default::default()
+        };
+        let actions = code_actions(&[diag], uri);
+        assert_eq!(actions.len(), 1);
     }
 
     #[test]
