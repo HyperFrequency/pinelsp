@@ -1,0 +1,17 @@
+{
+  "name": "tree-sitter-pine-nextjs-demo",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Browser demo: parse Pine Script with the WASM grammar via web-tree-sitter",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "^15",
+    "react": "^19",
+    "react-dom": "^19",
+    "web-tree-sitter": "^0.25"
+  }
+}
