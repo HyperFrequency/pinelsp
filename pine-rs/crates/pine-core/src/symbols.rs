@@ -37,18 +37,34 @@ pub fn definitions(doc: &Document) -> Vec<SymbolDef> {
 
 fn collect_defs(node: Node, src: &str, out: &mut Vec<SymbolDef>) {
     match node.kind() {
-        "variable_definition" => {
+        // `x = expr` and `x = switch/if ...` (the latter is a *_statement with an
+        // `initial_structure` RHS); both bind the `variable` field.
+        "variable_definition" | "variable_definition_statement" => {
             if let Some(id) = node.child_by_field_name("variable") {
                 push(out, id, src, SymbolKind::Variable);
             }
         }
         "function_declaration_statement" => {
-            if let Some(id) = node.child_by_field_name("function") {
+            // Regular functions use the `function` field; methods use `method`.
+            if let Some(id) = node
+                .child_by_field_name("function")
+                .or_else(|| node.child_by_field_name("method"))
+            {
                 push(out, id, src, SymbolKind::Function);
             }
             let mut cursor = node.walk();
             for arg in node.children_by_field_name("argument", &mut cursor) {
                 push(out, arg, src, SymbolKind::Parameter);
+            }
+        }
+        "for_statement" => {
+            if let Some(id) = node.child_by_field_name("counter") {
+                push(out, id, src, SymbolKind::Variable);
+            }
+        }
+        "import" => {
+            if let Some(id) = node.child_by_field_name("alias") {
+                push(out, id, src, SymbolKind::Variable);
             }
         }
         "type_definition_statement" => {
@@ -61,7 +77,7 @@ fn collect_defs(node: Node, src: &str, out: &mut Vec<SymbolDef>) {
                 push(out, id, src, SymbolKind::Enum);
             }
         }
-        "tuple_declaration" => {
+        "tuple_declaration" | "tuple_declaration_statement" => {
             let mut cursor = node.walk();
             for var in node.children_by_field_name("variables", &mut cursor) {
                 push(out, var, src, SymbolKind::Variable);

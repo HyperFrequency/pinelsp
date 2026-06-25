@@ -36,6 +36,7 @@ pub fn analyze(doc: &Document) -> Vec<Diagnostic> {
     check_version_directive(doc, &mut out);
     check_unused_variables(doc, &mut out);
     check_undefined_identifiers(doc, &mut out);
+    check_type_annotations(doc, &mut out);
     out.sort_by_key(|d| (d.start_byte, d.end_byte));
     out
 }
@@ -90,6 +91,12 @@ fn check_unused_variables(doc: &Document, out: &mut Vec<Diagnostic>) {
 /// (`obj.MEMBER`) and keyword-argument keys (`name=...`), which are not in any
 /// valid set and would otherwise be false positives.
 fn check_undefined_identifiers(doc: &Document, out: &mut Vec<Diagnostic>) {
+    // Identifier resolution is only reliable on a fully-parsed tree; on a file
+    // with syntax errors the partial parse produces spurious bare identifiers.
+    // Report the syntax error instead and skip undefined-id there.
+    if doc.has_errors() {
+        return;
+    }
     let user: HashSet<String> = symbols::definitions(doc)
         .into_iter()
         .map(|d| d.name)
@@ -121,6 +128,11 @@ fn walk_idents(
     namespaces: &HashSet<&'static str>,
     out: &mut Vec<Diagnostic>,
 ) {
+    // Don't resolve identifiers inside a parse error — they're unreliable and
+    // produce spurious "undeclared" noise. The syntax error is reported instead.
+    if node.is_error() {
+        return;
+    }
     if node.kind() == "identifier" && is_checkable_reference(node) {
         let name = &src[node.start_byte()..node.end_byte()];
         if !is_known(name, user, namespaces) {
@@ -149,6 +161,9 @@ fn is_checkable_reference(node: Node) -> bool {
     match parent.kind() {
         "attribute" => !is_field("attribute"),
         "keyword_argument" => !is_field("key"),
+        // type definitions hold only the type name + field declarations, not
+        // references (field access goes through `attribute` above).
+        "type_definition_statement" => false,
         _ => true,
     }
 }
@@ -161,6 +176,118 @@ fn is_known(name: &str, user: &HashSet<String>, namespaces: &HashSet<&'static st
         || builtins::variable(name).is_some()
         || builtins::constant(name).is_some()
         || builtins::is_keyword(name)
+}
+
+/// Variable declarations whose initializer type clearly cannot be assigned to
+/// the declared type (e.g. `int a = "hello"`). Conservative: only unambiguous
+/// base-type violations are flagged; complex/generic types and unknown
+/// inferences are skipped so false positives stay at zero.
+fn check_type_annotations(doc: &Document, out: &mut Vec<Diagnostic>) {
+    walk_type_checks(doc.root(), doc.text(), out);
+}
+
+fn walk_type_checks(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
+    if node.kind() == "variable_definition" {
+        if let (Some(ty), Some(init)) = (
+            node.child_by_field_name("type"),
+            node.child_by_field_name("initial_value"),
+        ) {
+            if let (Some(declared), Some(inferred)) =
+                (base_type_name(ty, src), infer_type(init, src))
+            {
+                if is_type_mismatch(&declared, &inferred) {
+                    out.push(Diagnostic {
+                        start_byte: init.start_byte(),
+                        end_byte: init.end_byte(),
+                        severity: Severity::Error,
+                        code: "type-mismatch",
+                        message: format!("Cannot assign `{inferred}` to `{declared}`"),
+                    });
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_type_checks(child, src, out);
+    }
+}
+
+/// The base type name from a `base_type(identifier)` annotation; `None` for
+/// generic/complex types (skipped).
+fn base_type_name(ty: Node, src: &str) -> Option<String> {
+    if ty.kind() != "base_type" {
+        return None;
+    }
+    let id = ty.named_child(0)?;
+    Some(src[id.start_byte()..id.end_byte()].to_string())
+}
+
+/// Infer the base type of a simple initializer expression; `None` (unknown) when
+/// it can't be determined confidently.
+fn infer_type(node: Node, src: &str) -> Option<String> {
+    let t = match node.kind() {
+        "integer" => "int",
+        "float" => "float",
+        "string" => "string",
+        "true" | "false" => "bool",
+        "identifier" => {
+            let name = &src[node.start_byte()..node.end_byte()];
+            return base_of(&builtins::variable(name)?.ty);
+        }
+        "call" => {
+            let func = node.child_by_field_name("function")?;
+            let fname = dotted(func, src)?;
+            return base_of(&builtins::function(&fname)?.returns);
+        }
+        _ => return None,
+    };
+    Some(t.to_string())
+}
+
+fn dotted(node: Node, src: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(src[node.start_byte()..node.end_byte()].to_string()),
+        "attribute" => {
+            let obj = node.child_by_field_name("object")?;
+            let attr = node.child_by_field_name("attribute")?;
+            Some(format!(
+                "{}.{}",
+                dotted(obj, src)?,
+                &src[attr.start_byte()..attr.end_byte()]
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Reduce a Pine type string (e.g. `"series float"`, `"input int"`,
+/// `"array<float>"`) to its base; `None` for unions like `int/float`.
+fn base_of(ty: &str) -> Option<String> {
+    let last = ty.rsplit(' ').next().unwrap_or(ty);
+    let base = last.split('<').next().unwrap_or(last);
+    if base.is_empty() || base.contains('/') {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+fn is_type_mismatch(declared: &str, inferred: &str) -> bool {
+    if declared == inferred {
+        return false;
+    }
+    let numeric = |t: &str| t == "int" || t == "float";
+    if numeric(declared) && numeric(inferred) {
+        return false; // int <-> float coerces
+    }
+    matches!(
+        (declared, inferred),
+        ("int" | "float", "string")
+            | ("bool", "string")
+            | ("string", "bool")
+            | ("int" | "float", "bool")
+            | ("bool", "int" | "float")
+    )
 }
 
 #[cfg(test)]
@@ -209,6 +336,53 @@ mod tests {
         assert!(analyze(&d)
             .iter()
             .any(|x| x.code == "undeclared-identifier" && x.message.contains("undefinedXYZ")));
+    }
+
+    #[test]
+    fn flags_type_mismatch_string_to_int() {
+        let d = doc("//@version=6\nint a = \"hello\"\nplot(a)\n");
+        assert!(analyze(&d)
+            .iter()
+            .any(|x| x.code == "type-mismatch" && x.message.contains("string")));
+    }
+
+    #[test]
+    fn int_float_coercion_not_flagged() {
+        let d = doc("//@version=6\nfloat x = 1\nplot(x)\n");
+        assert!(!analyze(&d).iter().any(|x| x.code == "type-mismatch"));
+    }
+
+    #[test]
+    fn builtin_typed_initializer_ok() {
+        // close is `series float`; assigning to `float` must not be flagged.
+        let d = doc("//@version=6\nfloat c = close\nplot(c)\n");
+        assert!(!analyze(&d).iter().any(|x| x.code == "type-mismatch"));
+    }
+
+    #[test]
+    fn switch_assignment_target_not_flagged() {
+        // `t = switch ...` binds t via variable_definition_statement.
+        let d = doc("//@version=6\nt = switch\n    close > open => 1\n    => 0\nplot(t)\n");
+        assert!(!analyze(&d).iter().any(|x| x.code == "undeclared-identifier"),
+                "switch-assigned var should be a definition");
+    }
+
+    #[test]
+    fn for_counter_not_flagged() {
+        let d = doc("//@version=6\nsum = 0.0\nfor i = 0 to 5\n    sum := sum + i\nplot(sum)\n");
+        let undeclared: Vec<_> = analyze(&d)
+            .into_iter()
+            .filter(|x| x.code == "undeclared-identifier")
+            .map(|x| x.message)
+            .collect();
+        assert!(undeclared.is_empty(), "for-counter `i` should be defined: {undeclared:?}");
+    }
+
+    #[test]
+    fn undefined_id_skipped_on_syntax_error() {
+        // Broken parse → undefined-id suppressed (syntax error reported instead).
+        let d = doc("//@version=6\nx = (1 +\n");
+        assert!(!analyze(&d).iter().any(|x| x.code == "undeclared-identifier"));
     }
 
     #[test]
