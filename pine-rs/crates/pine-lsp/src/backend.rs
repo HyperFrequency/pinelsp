@@ -33,7 +33,7 @@ impl Backend {
 
     async fn refresh(&self, uri: Url, text: &str) {
         let diagnostics = Document::parse(text)
-            .map(|d| features::syntax_diagnostics(&d))
+            .map(|d| features::all_diagnostics(&d))
             .unwrap_or_default();
         self.client
             .publish_diagnostics(uri, diagnostics, None)

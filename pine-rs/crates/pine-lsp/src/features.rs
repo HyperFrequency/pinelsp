@@ -39,6 +39,32 @@ pub fn syntax_diagnostics(doc: &Document) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// Semantic diagnostics from `pine-check`, converted to LSP.
+pub fn semantic_diagnostics(doc: &Document) -> Vec<Diagnostic> {
+    pine_check::analyze(doc)
+        .into_iter()
+        .map(|d| Diagnostic {
+            range: byte_range(doc, d.start_byte, d.end_byte),
+            severity: Some(match d.severity {
+                pine_check::Severity::Error => DiagnosticSeverity::ERROR,
+                pine_check::Severity::Warning => DiagnosticSeverity::WARNING,
+                pine_check::Severity::Info => DiagnosticSeverity::INFORMATION,
+            }),
+            code: Some(NumberOrString::String(d.code.to_string())),
+            source: Some("pine-lsp".into()),
+            message: d.message,
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// All diagnostics for a document: tree-sitter syntax errors + semantic checks.
+pub fn all_diagnostics(doc: &Document) -> Vec<Diagnostic> {
+    let mut diags = syntax_diagnostics(doc);
+    diags.extend(semantic_diagnostics(doc));
+    diags
+}
+
 /// Collect ERROR/MISSING nodes, pruning subtrees that parsed cleanly.
 fn collect_errors<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
     if node.is_error() || node.is_missing() {
