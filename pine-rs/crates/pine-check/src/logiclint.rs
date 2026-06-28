@@ -9,13 +9,14 @@ use tree_sitter::Node;
 
 pub(crate) fn check(doc: &Document, out: &mut Vec<Diagnostic>) {
     walk(doc.root(), doc.text(), out);
-    check_strategy_without_orders(doc, out);
+    check_strategy_orders(doc, out);
 }
 
 fn walk(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
     match node.kind() {
         "call" => check_request_security_lookahead(node, src, out),
         "subscript" => check_negative_history(node, src, out),
+        "reassignment" => check_self_assignment(node, src, out),
         "if_statement" | "for_statement" | "for_in_statement" | "while_statement" => {
             check_ta_stateful_in_conditional(node, src, out)
         }
@@ -131,6 +132,45 @@ fn collect_direct_stateful_ta(node: Node, src: &str, out: &mut Vec<Diagnostic>) 
     }
 }
 
+/// `x := x` is a no-op: assigning a variable to itself with the plain `:=`
+/// operator changes nothing. TradingView accepts the syntax (it is not a compile
+/// error), so this is a Warning, not an Error. False-positive discipline:
+///  - only the plain `:=` operator fires; compound ops (`+=`, `-=`, `*=`, `/=`,
+///    `%=`) are semantically meaningful (`x += x` doubles `x`) and never fire;
+///  - both sides must be a *bare* `identifier` with byte-equal text, so attribute
+///    LHS like `foo.bar := foo.bar` (which could have property side effects) and
+///    any non-identifier RHS (`x := x + 1`) are excluded. Net false-positives ~0.
+fn check_self_assignment(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
+    let Some(operator) = node.child_by_field_name("operator") else {
+        return;
+    };
+    // Only the plain assignment is a no-op; compound assignments mutate `x`.
+    if node_text(operator, src) != ":=" {
+        return;
+    }
+    let (Some(variable), Some(value)) = (
+        node.child_by_field_name("variable"),
+        node.child_by_field_name("value"),
+    ) else {
+        return;
+    };
+    // Restrict to bare identifier <-> identifier to keep false-positives at zero.
+    if variable.kind() != "identifier" || value.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(variable, src);
+    if name != node_text(value, src) {
+        return;
+    }
+    out.push(Diagnostic {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        severity: Severity::Warning,
+        code: "self-assignment",
+        message: format!("Self-assignment `{name} := {name}` has no effect"),
+    });
+}
+
 /// A `strategy(...)` script that never places an order is almost certainly
 /// incomplete. Document-wide advisory (Info): TradingView itself does NOT reject
 /// such a script, and a library / partial template legitimately has no entries —
@@ -139,28 +179,51 @@ fn collect_direct_stateful_ta(node: Node, src: &str, out: &mut Vec<Diagnostic>) 
 /// guarded by `if` are still found, keeping false positives near zero. Skipped
 /// entirely when the file has any `import` (an order could come from an imported
 /// library, which a single-document scan cannot see).
-fn check_strategy_without_orders(doc: &Document, out: &mut Vec<Diagnostic>) {
+fn check_strategy_orders(doc: &Document, out: &mut Vec<Diagnostic>) {
     let src = doc.text();
-    let mut strategy_decl: Option<Node> = None;
-    let mut has_order = false;
-    let mut has_import = false;
-    scan_strategy(doc.root(), src, &mut strategy_decl, &mut has_order, &mut has_import);
+    let mut scan = StrategyScan::default();
+    scan_strategy(doc.root(), src, &mut scan);
 
-    if has_import {
+    // An order (or exit) could come from an imported library that a
+    // single-document scan cannot see, so both checks are suppressed when the
+    // file has any `import`.
+    if scan.has_import {
         return;
     }
-    if let Some(decl) = strategy_decl {
-        if !has_order {
-            out.push(Diagnostic {
-                start_byte: decl.start_byte(),
-                end_byte: decl.end_byte(),
-                severity: Severity::Info,
-                code: "strategy-no-orders",
-                message: "`strategy()` script never places an order \
-                          (no strategy.entry/order/exit/close/close_all call found)"
-                    .to_string(),
-            });
-        }
+    let Some(decl) = scan.strategy_decl else {
+        return;
+    };
+
+    if !scan.has_order {
+        out.push(Diagnostic {
+            start_byte: decl.start_byte(),
+            end_byte: decl.end_byte(),
+            severity: Severity::Info,
+            code: "strategy-no-orders",
+            message: "`strategy()` script never places an order \
+                      (no strategy.entry/order/exit/close/close_all call found)"
+                .to_string(),
+        });
+        return;
+    }
+
+    // Entry placed but nothing ever closes the position. Fire only with EXACTLY
+    // ONE entry call: two-or-more entries is the valid reverse-exit pattern
+    // (a long is closed by opening an opposite short), which must not be flagged.
+    // Info severity (advisory) per false-positive discipline: TradingView does
+    // not reject this and residual cases (e.g. account-level closing) stay
+    // non-blocking.
+    if scan.entry_count == 1 && !scan.has_exit {
+        out.push(Diagnostic {
+            start_byte: decl.start_byte(),
+            end_byte: decl.end_byte(),
+            severity: Severity::Info,
+            code: "strategy-no-exit",
+            message: "`strategy.entry` has no matching exit \
+                      (no strategy.exit/close/close_all call found); \
+                      positions may never be closed"
+                .to_string(),
+        });
     }
 }
 
@@ -172,31 +235,48 @@ const ORDER_CALLS: &[&str] = &[
     "strategy.close_all",
 ];
 
-fn scan_strategy<'a>(
-    node: Node<'a>,
-    src: &str,
-    strategy_decl: &mut Option<Node<'a>>,
-    has_order: &mut bool,
-    has_import: &mut bool,
-) {
+/// Calls that open a position. `strategy.order` is the low-level primitive and
+/// `strategy.entry` the high-level one; both count as entries for the
+/// reverse-exit suppression heuristic.
+const ENTRY_CALLS: &[&str] = &["strategy.entry", "strategy.order"];
+
+/// Calls that close / reduce a position.
+const EXIT_CALLS: &[&str] = &["strategy.exit", "strategy.close", "strategy.close_all"];
+
+#[derive(Default)]
+struct StrategyScan<'a> {
+    strategy_decl: Option<Node<'a>>,
+    has_order: bool,
+    has_import: bool,
+    entry_count: usize,
+    has_exit: bool,
+}
+
+fn scan_strategy<'a>(node: Node<'a>, src: &str, scan: &mut StrategyScan<'a>) {
     if node.kind() == "import" {
-        *has_import = true;
+        scan.has_import = true;
     }
     if node.kind() == "call" {
         if let Some(func) = node.child_by_field_name("function") {
             if let Some(name) = dotted(func, src) {
-                if name == "strategy" && strategy_decl.is_none() && is_top_level_call(node) {
-                    *strategy_decl = Some(node);
+                if name == "strategy" && scan.strategy_decl.is_none() && is_top_level_call(node) {
+                    scan.strategy_decl = Some(node);
                 }
                 if ORDER_CALLS.contains(&name.as_str()) {
-                    *has_order = true;
+                    scan.has_order = true;
+                }
+                if ENTRY_CALLS.contains(&name.as_str()) {
+                    scan.entry_count += 1;
+                }
+                if EXIT_CALLS.contains(&name.as_str()) {
+                    scan.has_exit = true;
                 }
             }
         }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        scan_strategy(child, src, strategy_decl, has_order, has_import);
+        scan_strategy(child, src, scan);
     }
 }
 
@@ -386,5 +466,96 @@ mod tests {
             .filter(|x| x.code == "ta-conditional")
             .count();
         assert_eq!(hits, 1, "ta.rsi in nested if should be reported exactly once");
+    }
+
+    // --- self-assignment (Warning) ---
+
+    #[test]
+    fn flags_self_assignment() {
+        let d = doc("//@version=6\nindicator(\"x\")\nx = 1\nx := x\nplot(x)\n");
+        assert!(crate::analyze(&d).iter().any(|diag| diag.code == "self-assignment"
+            && diag.severity == Severity::Warning
+            && diag.message.contains("x := x")));
+    }
+
+    #[test]
+    fn flags_self_assignment_other_name() {
+        let d = doc("//@version=6\nindicator(\"x\")\nlen = 14\nlen := len\nplot(close)\n");
+        assert!(crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "self-assignment"));
+    }
+
+    #[test]
+    fn compound_self_assignment_not_flagged() {
+        // `x += x` doubles x — semantically meaningful, not a no-op.
+        let d = doc("//@version=6\nindicator(\"x\")\nx = 1\nx += x\nplot(x)\n");
+        assert!(!crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "self-assignment"));
+    }
+
+    #[test]
+    fn self_assignment_with_expr_value_not_flagged() {
+        // RHS is a math_operation, not a bare identifier.
+        let d = doc("//@version=6\nindicator(\"x\")\nx = 1\nx := x + 1\nplot(x)\n");
+        assert!(!crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "self-assignment"));
+    }
+
+    // --- strategy-no-exit (Info) ---
+
+    #[test]
+    fn flags_strategy_no_exit_guarded_entry() {
+        let d = doc(
+            "//@version=6\nstrategy(\"S\")\nif close > open\n    strategy.entry(\"L\", strategy.long)\n",
+        );
+        assert!(crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "strategy-no-exit" && diag.severity == Severity::Info));
+    }
+
+    #[test]
+    fn flags_strategy_no_exit_top_level_entry() {
+        let d =
+            doc("//@version=6\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\nplot(close)\n");
+        assert!(crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "strategy-no-exit" && diag.severity == Severity::Info));
+    }
+
+    #[test]
+    fn strategy_with_exit_not_flagged_no_exit() {
+        let d = doc("//@version=6\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\nstrategy.exit(\"X\", \"L\", stop=low)\n");
+        assert!(!crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "strategy-no-exit"));
+    }
+
+    #[test]
+    fn two_entries_reverse_exit_not_flagged() {
+        // Two entries = reverse-exit pattern (close long by opening short).
+        let d = doc("//@version=6\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\nstrategy.entry(\"S\", strategy.short)\n");
+        assert!(!crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "strategy-no-exit"));
+    }
+
+    #[test]
+    fn indicator_never_flagged_strategy_no_exit() {
+        let d = doc("//@version=6\nindicator(\"x\")\nplot(close)\n");
+        assert!(!crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "strategy-no-exit"));
+    }
+
+    #[test]
+    fn strategy_with_import_not_flagged_no_exit() {
+        // Exit could live in the imported library; suppressed by import guard.
+        let d = doc("//@version=6\nimport Foo/Bar/1 as lib\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\n");
+        assert!(!crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "strategy-no-exit"));
     }
 }
