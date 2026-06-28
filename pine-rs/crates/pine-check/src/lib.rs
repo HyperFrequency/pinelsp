@@ -41,6 +41,7 @@ pub fn analyze(doc: &Document) -> Vec<Diagnostic> {
     check_type_annotations(doc, &mut out);
     check_call_arguments(doc, &mut out);
     check_na_comparison(doc, &mut out);
+    check_constant_condition(doc, &mut out);
     logiclint::check(doc, &mut out);
     out.sort_by_key(|d| (d.start_byte, d.end_byte));
     out
@@ -417,6 +418,45 @@ fn walk_na(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
     }
 }
 
+/// A bare boolean literal `true`/`false` used as the condition of an `if`
+/// statement or a ternary `?:` makes the branch unconditional or dead. A
+/// Warning (TradingView accepts the syntax). Restricted strictly to bare
+/// literal `true`/`false` nodes — no constant folding of expressions — so it
+/// can never fire on valid dynamic Pine. `while true` is deliberately NOT
+/// flagged: it is a legitimate loop-with-break idiom in Pine.
+fn check_constant_condition(doc: &Document, out: &mut Vec<Diagnostic>) {
+    // The condition field is only reliable on a fully-parsed tree.
+    if doc.has_errors() {
+        return;
+    }
+    walk_constant_condition(doc.root(), out);
+}
+
+fn walk_constant_condition(node: Node, out: &mut Vec<Diagnostic>) {
+    if matches!(node.kind(), "if_statement" | "conditional_expression") {
+        if let Some(cond) = node.child_by_field_name("condition") {
+            let message = match cond.kind() {
+                "true" => Some("Condition is always `true`, the branch is unconditional"),
+                "false" => Some("Condition is always `false`, the branch is dead code"),
+                _ => None,
+            };
+            if let Some(message) = message {
+                out.push(Diagnostic {
+                    start_byte: cond.start_byte(),
+                    end_byte: cond.end_byte(),
+                    severity: Severity::Warning,
+                    code: "constant-condition",
+                    message: message.to_string(),
+                });
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_constant_condition(child, out);
+    }
+}
+
 fn is_type_mismatch(declared: &str, inferred: &str) -> bool {
     if declared == inferred {
         return false;
@@ -561,6 +601,34 @@ mod tests {
         // Broken parse → undefined-id suppressed (syntax error reported instead).
         let d = doc("//@version=6\nx = (1 +\n");
         assert!(!analyze(&d).iter().any(|x| x.code == "undeclared-identifier"));
+    }
+
+    #[test]
+    fn flags_constant_condition_if_true() {
+        let d = doc("//@version=6\nindicator(\"x\")\nif true\n    plot(close)\n");
+        assert!(analyze(&d)
+            .iter()
+            .any(|x| x.code == "constant-condition" && x.message.contains("always `true`")));
+    }
+
+    #[test]
+    fn flags_constant_condition_ternary_false() {
+        let d = doc("//@version=6\nx = false ? 1 : 2\nplot(x)\n");
+        assert!(analyze(&d)
+            .iter()
+            .any(|x| x.code == "constant-condition" && x.message.contains("always `false`")));
+    }
+
+    #[test]
+    fn dynamic_bool_variable_condition_not_flagged() {
+        let d = doc("//@version=6\nflag = close > open\nif flag\n    plot(close)\n");
+        assert!(!analyze(&d).iter().any(|x| x.code == "constant-condition"));
+    }
+
+    #[test]
+    fn dynamic_ternary_condition_not_flagged() {
+        let d = doc("//@version=6\nx = close > open ? 1 : 2\nplot(x)\n");
+        assert!(!analyze(&d).iter().any(|x| x.code == "constant-condition"));
     }
 
     #[test]

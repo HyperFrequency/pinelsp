@@ -9,18 +9,206 @@ use tree_sitter::Node;
 
 pub(crate) fn check(doc: &Document, out: &mut Vec<Diagnostic>) {
     walk(doc.root(), doc.text(), out);
+    check_strategy_without_orders(doc, out);
 }
 
 fn walk(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
     match node.kind() {
         "call" => check_request_security_lookahead(node, src, out),
         "subscript" => check_negative_history(node, src, out),
+        "if_statement" | "for_statement" | "for_in_statement" | "while_statement" => {
+            check_ta_stateful_in_conditional(node, src, out)
+        }
         _ => {}
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk(child, src, out);
     }
+}
+
+/// `ta.*` accumulator / moving-average / lookback functions whose internal state
+/// depends on being evaluated on *every* bar. Calling them only inside an `if`/
+/// loop body produces a different series than calling them unconditionally — the
+/// classic Pine series-consistency pitfall. The cross/rising/falling family is
+/// deliberately EXCLUDED: those are idiomatically (and safely) used as signal
+/// conditions, so flagging them would be a major false-positive source.
+const STATEFUL_TA: &[&str] = &[
+    "ta.sma",
+    "ta.ema",
+    "ta.rma",
+    "ta.wma",
+    "ta.vwma",
+    "ta.hma",
+    "ta.alma",
+    "ta.swma",
+    "ta.linreg",
+    "ta.rsi",
+    "ta.atr",
+    "ta.tr",
+    "ta.cci",
+    "ta.mfi",
+    "ta.cmo",
+    "ta.cog",
+    "ta.mom",
+    "ta.roc",
+    "ta.stdev",
+    "ta.dev",
+    "ta.variance",
+    "ta.highest",
+    "ta.lowest",
+    "ta.highestbars",
+    "ta.lowestbars",
+    "ta.barssince",
+    "ta.valuewhen",
+    "ta.cum",
+    "ta.change",
+    "ta.percentrank",
+    "ta.median",
+    "ta.mode",
+    "ta.range",
+    "ta.bb",
+    "ta.bbw",
+    "ta.kc",
+    "ta.kcw",
+    "ta.macd",
+    "ta.dmi",
+    "ta.sar",
+    "ta.supertrend",
+    "ta.wpr",
+    "ta.correlation",
+];
+
+/// Scan the *immediate* body/consequence block of a conditional (`if`/`for`/
+/// `while`) for direct stateful `ta.*` calls and warn on each. Only the body is
+/// scanned — never the condition (calling a stateful `ta.*` inside the condition
+/// is every-bar-safe), and the scan does NOT descend into nested
+/// `if`/`for`/`while` blocks: each nested conditional's own visit owns its
+/// direct calls, so a call is reported exactly once at its innermost enclosing
+/// conditional.
+fn check_ta_stateful_in_conditional(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
+    // if_statement exposes the body under `consequence`; loops under `body`.
+    let body = node
+        .child_by_field_name("consequence")
+        .or_else(|| node.child_by_field_name("body"));
+    let Some(body) = body else {
+        return;
+    };
+    collect_direct_stateful_ta(body, src, out);
+}
+
+/// Recurse through `node` collecting stateful `ta.*` calls, but stop descending
+/// at any nested conditional (its own visit will report its calls).
+fn collect_direct_stateful_ta(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
+    if node.kind() == "call" {
+        if let Some(func) = node.child_by_field_name("function") {
+            if let Some(name) = dotted(func, src) {
+                if STATEFUL_TA.contains(&name.as_str()) {
+                    out.push(Diagnostic {
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                        severity: Severity::Warning,
+                        code: "ta-conditional",
+                        message: format!(
+                            "`{name}` is stateful and should be called on every bar; \
+                             calling it only inside a conditional can make its series inconsistent"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        // A nested conditional owns its own direct calls; don't double-report.
+        if matches!(
+            child.kind(),
+            "if_statement" | "for_statement" | "for_in_statement" | "while_statement"
+        ) {
+            continue;
+        }
+        collect_direct_stateful_ta(child, src, out);
+    }
+}
+
+/// A `strategy(...)` script that never places an order is almost certainly
+/// incomplete. Document-wide advisory (Info): TradingView itself does NOT reject
+/// such a script, and a library / partial template legitimately has no entries —
+/// so per the false-positive-discipline rule this is non-blocking. A document-
+/// wide scan (not scope-limited) means entries wrapped in user functions or
+/// guarded by `if` are still found, keeping false positives near zero. Skipped
+/// entirely when the file has any `import` (an order could come from an imported
+/// library, which a single-document scan cannot see).
+fn check_strategy_without_orders(doc: &Document, out: &mut Vec<Diagnostic>) {
+    let src = doc.text();
+    let mut strategy_decl: Option<Node> = None;
+    let mut has_order = false;
+    let mut has_import = false;
+    scan_strategy(doc.root(), src, &mut strategy_decl, &mut has_order, &mut has_import);
+
+    if has_import {
+        return;
+    }
+    if let Some(decl) = strategy_decl {
+        if !has_order {
+            out.push(Diagnostic {
+                start_byte: decl.start_byte(),
+                end_byte: decl.end_byte(),
+                severity: Severity::Info,
+                code: "strategy-no-orders",
+                message: "`strategy()` script never places an order \
+                          (no strategy.entry/order/exit/close/close_all call found)"
+                    .to_string(),
+            });
+        }
+    }
+}
+
+const ORDER_CALLS: &[&str] = &[
+    "strategy.entry",
+    "strategy.order",
+    "strategy.exit",
+    "strategy.close",
+    "strategy.close_all",
+];
+
+fn scan_strategy<'a>(
+    node: Node<'a>,
+    src: &str,
+    strategy_decl: &mut Option<Node<'a>>,
+    has_order: &mut bool,
+    has_import: &mut bool,
+) {
+    if node.kind() == "import" {
+        *has_import = true;
+    }
+    if node.kind() == "call" {
+        if let Some(func) = node.child_by_field_name("function") {
+            if let Some(name) = dotted(func, src) {
+                if name == "strategy" && strategy_decl.is_none() && is_top_level_call(node) {
+                    *strategy_decl = Some(node);
+                }
+                if ORDER_CALLS.contains(&name.as_str()) {
+                    *has_order = true;
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        scan_strategy(child, src, strategy_decl, has_order, has_import);
+    }
+}
+
+/// True when a call is a top-level declaration, i.e. its CST ancestry is
+/// `source_file` -> `simple_statement` -> `call`. The `strategy()` declaration
+/// must be at the top level; a same-named member call nested elsewhere
+/// shouldn't be mistaken for the declaration.
+fn is_top_level_call(call: Node) -> bool {
+    call.parent()
+        .filter(|p| p.kind() == "simple_statement")
+        .and_then(|p| p.parent())
+        .is_some_and(|gp| gp.kind() == "source_file")
 }
 
 /// `request.security(..., lookahead=barmerge.lookahead_on)` repaints — the
@@ -123,5 +311,80 @@ mod tests {
     fn flags_negative_history() {
         let d = doc("//@version=6\nindicator(\"x\")\nplot(close[-1])\n");
         assert!(crate::analyze(&d).iter().any(|x| x.code == "future-leak"));
+    }
+
+    // --- strategy-without-entry (Info, document-wide) ---
+
+    #[test]
+    fn flags_strategy_without_orders() {
+        let d = doc("//@version=6\nstrategy(\"S\")\nplot(close)\n");
+        assert!(crate::analyze(&d)
+            .iter()
+            .any(|x| x.code == "strategy-no-orders" && x.severity == Severity::Info));
+    }
+
+    #[test]
+    fn flags_strategy_with_signal_var_but_no_order() {
+        let d = doc("//@version=6\nstrategy(\"S\")\nlongCond = ta.crossover(close, open)\nplot(close)\n");
+        assert!(crate::analyze(&d).iter().any(|x| x.code == "strategy-no-orders"));
+    }
+
+    #[test]
+    fn strategy_with_guarded_entry_not_flagged() {
+        // entry present, even though guarded by an `if`
+        let d = doc("//@version=6\nstrategy(\"S\")\nif close > open\n    strategy.entry(\"L\", strategy.long)\n");
+        assert!(!crate::analyze(&d).iter().any(|x| x.code == "strategy-no-orders"));
+    }
+
+    #[test]
+    fn indicator_never_flagged_strategy_no_orders() {
+        let d = doc("//@version=6\nindicator(\"x\")\nplot(close)\n");
+        assert!(!crate::analyze(&d).iter().any(|x| x.code == "strategy-no-orders"));
+    }
+
+    // --- ta-stateful-in-conditional (Warning) ---
+
+    #[test]
+    fn flags_ta_rsi_in_if_body() {
+        let d = doc("//@version=6\nindicator(\"x\")\nif close > open\n    myrsi = ta.rsi(close, 14)\n    plot(myrsi)\n");
+        assert!(crate::analyze(&d)
+            .iter()
+            .any(|x| x.code == "ta-conditional" && x.message.contains("ta.rsi")));
+    }
+
+    #[test]
+    fn flags_ta_sma_in_for_body() {
+        let d = doc("//@version=6\nindicator(\"x\")\nfor i = 0 to 5\n    s = ta.sma(close, 14)\n");
+        assert!(crate::analyze(&d)
+            .iter()
+            .any(|x| x.code == "ta-conditional" && x.message.contains("ta.sma")));
+    }
+
+    #[test]
+    fn ta_rsi_unconditional_not_flagged() {
+        let d = doc("//@version=6\nindicator(\"x\")\nmyrsi = ta.rsi(close, 14)\nplot(close > open ? myrsi : na)\n");
+        assert!(!crate::analyze(&d).iter().any(|x| x.code == "ta-conditional"));
+    }
+
+    #[test]
+    fn ta_crossover_in_condition_not_flagged() {
+        // ta.crossover is excluded from the allowlist AND it sits in the
+        // condition, not the body.
+        let d = doc("//@version=6\nindicator(\"x\")\nif ta.crossover(close, open)\n    plot(close)\n");
+        assert!(!crate::analyze(&d).iter().any(|x| x.code == "ta-conditional"));
+    }
+
+    #[test]
+    fn nested_conditional_ta_reported_once() {
+        // ta.rsi sits in an inner `if` nested inside an outer `if`; it must be
+        // reported exactly once (owned by the inner conditional's visit).
+        let d = doc(
+            "//@version=6\nindicator(\"x\")\nif close > open\n    if high > low\n        r = ta.rsi(close, 14)\n        plot(r)\n",
+        );
+        let hits = crate::analyze(&d)
+            .iter()
+            .filter(|x| x.code == "ta-conditional")
+            .count();
+        assert_eq!(hits, 1, "ta.rsi in nested if should be reported exactly once");
     }
 }
