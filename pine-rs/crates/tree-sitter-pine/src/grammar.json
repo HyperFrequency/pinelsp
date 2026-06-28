@@ -919,7 +919,7 @@
           "name": "initial_value",
           "content": {
             "type": "SYMBOL",
-            "name": "call"
+            "name": "expression"
           }
         }
       ]

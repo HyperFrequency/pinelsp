@@ -213,7 +213,7 @@ module.exports = grammar({
 			field('variables', sep1($.identifier, ',')),
 			']',
 			'=',
-			field('initial_value', $.call)
+			field('initial_value', $.expression)
 		),
 		tuple_declaration_statement: $ => seq(
 			'[',

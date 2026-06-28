@@ -1401,7 +1401,7 @@
         "required": true,
         "types": [
           {
-            "type": "call",
+            "type": "expression",
             "named": true
           }
         ]
