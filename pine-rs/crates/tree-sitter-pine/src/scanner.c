@@ -75,6 +75,25 @@ bool tree_sitter_pine_external_scanner_scan(void *payload, TSLexer *lexer, const
 	}
 
 next:
+	// A line whose first non-whitespace char is `[` always begins a new
+	// statement (tuple destructuring), never a line continuation: a wrapped
+	// subscript or array literal keeps its `[` on the same physical line as its
+	// base/opening paren (see subscript-vs-tuple.pine:5). Force the statement
+	// break here, BEFORE the `% 4` continuation check below, so that an
+	// odd-indented tuple line (e.g. indentation-edge-cases.pine:11 ` [c, d] =`)
+	// does not get swallowed as a continuation — which would otherwise suppress
+	// the NEWLINE that closes the preceding comment and turn it into an ERROR.
+	//
+	// The valid_symbols guard is load-bearing: it only forces the break where
+	// the grammar already expects a statement boundary. The one legitimate
+	// `[`-starting continuation in the corpus (function-arg-continuation.pine:65
+	// `    [1, 2, 3])` inside an open `func(... =` paren) sits where neither
+	// NEWLINE nor DEDENT is valid, so the break does not fire there.
+	if (found_end_of_line && !lexer->eof(lexer) && lexer->lookahead == '[' &&
+	    (valid_symbols[NEWLINE] || valid_symbols[DEDENT])) {
+		goto emit_break;
+	}
+
 	if (indent_length % 4 != 0) {
 		// line continue
 		return false;
@@ -112,6 +131,7 @@ next:
 		}
 	}
 
+emit_break:
 	if (found_end_of_line) {
 		if (scanner->indents.size > 0) {
 			uint16_t current_indent_length = *array_back(&scanner->indents);
