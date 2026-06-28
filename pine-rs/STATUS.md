@@ -7,7 +7,7 @@ grammar binding set. Branch: `feat/rust-server`.
 ## Proof (verified)
 
 - **Workspace:** 7 crates — `tree-sitter-pine`, `pine-data-codegen`, `pine-core`,
-  `pine-check`, `pine-lsp`, `pine-cli`, `pine-mcp`. `cargo test` → **146 passing**.
+  `pine-check`, `pine-lsp`, `pine-cli`, `pine-mcp`. `cargo test` → **156 passing**.
 - **Builtins:** 457 functions / 90 variables / 237 constants / 28 keywords,
   embedded from the canonical TS pine-data.
 - **LSP (14 providers, server-verified over stdio):** completion, hover,
@@ -28,8 +28,25 @@ grammar binding set. Branch: `feat/rust-server`.
 - **MCP server:** 4 tools over stdio JSON-RPC (validate / lookup / list / format).
 - **Bindings — 7/9 verified:** Rust, C, C++, Python, Go, Swift(build), WASM
   (via web-tree-sitter). Grammar: kvarenzn base + enum, ABI 15.
+- **Production hardening:** server `tracing` logging to stderr (`PINE_LOG`/
+  `RUST_LOG`; stdout stays pure JSON-RPC); panic isolation — handlers run under
+  `catch_unwind` and return safe defaults so one bad request can't kill the
+  server; import resolution cached by `(namespace, @source path, mtime)` (no
+  per-keystroke re-read/re-parse); stdio LSP integration test (`tests/lsp_stdio.rs`,
+  drives the real binary) + large-file perf guard. CI authored + locally green:
+  `.github/workflows/rust-ci.yml` (fmt + clippy `-D warnings` + test matrix +
+  `cargo deny`) and `rust-release.yml` (per-platform binaries + secret-gated
+  registry publish). VS Code extension prefers a bundled Rust binary, falls back
+  to the TS server (`pine.rustServerPath` overrides). MIT `LICENSE` + `CHANGELOG`
+  + `deny.toml`; crates at 0.1.0 with publish metadata.
 
 ## Residual items (external ceilings / open-ended)
+
+- **Release execution (needs a CI runner + credentials):** the Rust CI + release
+  workflows are authored and locally validated (fmt/clippy/test/`cargo deny` all
+  green here; YAML parses), but EXECUTING GitHub Actions, building the per-platform
+  release binaries, and publishing to crates.io / npm / PyPI / NuGet require CI
+  runners and registry secrets — not available in this environment.
 
 - **Bindings 2/9 blocked by this environment:** Node-native (node-gyp 8.4.1 can't
   build the tree-sitter npm runtime on node 26 — WASM covers JS meanwhile); C#
@@ -55,7 +72,7 @@ grammar binding set. Branch: `feat/rust-server`.
 ## Try it
 
 ```bash
-cd pine-rs && cargo test                      # 59 tests
+cd pine-rs && cargo test                      # 156 tests
 cargo run -p pine-cli -- some.pine            # lint
 python3 scripts/differential.py              # oracle parity
 # VS Code: set "pine.rustServerPath" to target/release/pine-lsp
