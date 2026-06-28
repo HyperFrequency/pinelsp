@@ -7,7 +7,7 @@ grammar binding set. Branch: `feat/rust-server`.
 ## Proof (verified)
 
 - **Workspace:** 7 crates — `tree-sitter-pine`, `pine-data-codegen`, `pine-core`,
-  `pine-check`, `pine-lsp`, `pine-cli`, `pine-mcp`. `cargo test` → **128 passing**.
+  `pine-check`, `pine-lsp`, `pine-cli`, `pine-mcp`. `cargo test` → **134 passing**.
 - **Builtins:** 457 functions / 90 variables / 237 constants / 28 keywords,
   embedded from the canonical TS pine-data.
 - **LSP (14 providers, server-verified over stdio):** completion, hover,
@@ -39,19 +39,17 @@ grammar binding set. Branch: `feat/rust-server`.
   `missing-argument` is correct but gated by pine-data's `required` flags (only
   28/457 functions mark any param required). Remaining (ternary/logical operand
   types, special-cases) tracked.
-- **Grammar v6 completeness:** 35/42 syntax fixtures parse clean (block comments,
-  nested generics `<array<float>>`, enum integer values, and leading-operator line
-  continuation `?`/`:`/`.` at line start now fixed via the external scanner). The
-  residual 7 are the hardest cases: tuple-vs-subscript (`[a,b] =` after a statement
-  — a GLR conflict needing scanner-gating of `[` to same-line), switch-as-RHS /
-  inline-switch-with-tuples, and indentation edge cases. Higher-risk
-  grammar/conflict work, deferred.
-- **Imports / multi-file IntelliSense** (`/// @source`): three slices landed —
-  `pine-core::imports` parses `import user/lib/v as alias` + `/// @source` into a
-  typed `ImportTable`; `pine-core::resolve_imports` reads local `@source` lib files
-  and extracts their `export`ed symbols (path-traversal-safe, descriptive); and
-  `pine-lsp` surfaces imported namespaces in hover + completion. Wiring the
-  resolved exports into LSP cross-file completion / goto-definition remains.
+- **Grammar v6 completeness:** 40/42 syntax fixtures parse clean (block comments,
+  nested generics `<array<float>>`, enum integer values, leading-operator line
+  continuation `?`/`:`/`.`, and tuple-declaration RHS — `[a,b] = expr` after a
+  statement — now fixed). The residual 2 are edge cases: keyword-as-identifier
+  parameter names and an indentation edge case.
+- **Imports / multi-file IntelliSense** (`/// @source`): the pipeline now spans
+  parse → resolve → IntelliSense. `pine-core::imports`/`resolve_imports` parse and
+  resolve local `@source` libs (path-traversal-safe); `pine-lsp` provides hover,
+  bare-namespace completion, AND cross-file `alias.member` completion drawn from a
+  library's `export`ed symbols. Goto-definition into the lib file remains (needs
+  export source-locations on `ExportedSymbol`).
 
 ## Try it
 
