@@ -6,6 +6,7 @@
 //! phases; for now a `Document` is a full parse of its source text.
 
 pub mod builtins;
+pub mod imports;
 pub mod symbols;
 pub mod text;
 
