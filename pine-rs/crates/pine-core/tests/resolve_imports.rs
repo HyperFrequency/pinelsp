@@ -45,9 +45,16 @@ fn local_source_resolves_to_expected_exported_symbols() {
     let resolved = resolve_imports(&table, &libs_dir());
 
     let mu = resolved.by_alias("mu").expect("mu");
-    let ImportResolution::Resolved(symbols) = &mu.resolution else {
+    let ImportResolution::Resolved { symbols, path } = &mu.resolution else {
         panic!("expected Resolved, got {:?}", mu.resolution);
     };
+
+    // The resolved path is the canonical absolute lib file.
+    assert!(path.is_absolute(), "resolved path must be absolute: {path:?}");
+    assert!(
+        path.ends_with("math_utils.pine"),
+        "resolved path must point at the lib file: {path:?}"
+    );
 
     // Only the two exported functions; `helper` (non-exported) is excluded.
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
@@ -77,7 +84,7 @@ fn local_source_resolves_method_and_types() {
     let resolved = resolve_imports(&table, &libs_dir());
 
     let wm = resolved.by_alias("wm").expect("wm");
-    let ImportResolution::Resolved(wm_syms) = &wm.resolution else {
+    let ImportResolution::Resolved { symbols: wm_syms, .. } = &wm.resolution else {
         panic!("expected Resolved for wm, got {:?}", wm.resolution);
     };
     assert_eq!(wm_syms.len(), 1);
@@ -85,7 +92,7 @@ fn local_source_resolves_method_and_types() {
     assert_eq!(wm_syms[0].kind, ExportKind::Method);
 
     let te = resolved.by_alias("te").expect("te");
-    let ImportResolution::Resolved(te_syms) = &te.resolution else {
+    let ImportResolution::Resolved { symbols: te_syms, .. } = &te.resolution else {
         panic!("expected Resolved for te, got {:?}", te.resolution);
     };
     // Exported Point (Type) + Color (Enum); Internal/Hidden excluded.
@@ -154,7 +161,7 @@ fn lib_with_parse_errors_still_recovers_exports() {
     let resolved = resolve_imports(&table, &libs_dir());
 
     let b = resolved.by_alias("b").expect("b");
-    let ImportResolution::Resolved(syms) = &b.resolution else {
+    let ImportResolution::Resolved { symbols: syms, .. } = &b.resolution else {
         panic!(
             "a lib with ERROR nodes must still Resolve best-effort, got {:?}",
             b.resolution

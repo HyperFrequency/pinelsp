@@ -240,7 +240,7 @@ fn append_imported_members(
     else {
         return;
     };
-    if let ImportResolution::Resolved(symbols) = &matched.resolution {
+    if let ImportResolution::Resolved { symbols, .. } = &matched.resolution {
         for symbol in symbols {
             items.push(exported_item(symbol));
         }
@@ -531,14 +531,123 @@ fn to_symbol_kind(kind: DefKind) -> SymbolKind {
 }
 
 /// Go-to-definition for the user symbol under the cursor.
-pub fn goto_definition(doc: &Document, pos: Position, uri: Url) -> Option<GotoDefinitionResponse> {
+///
+/// Same-file resolution runs FIRST and is unchanged: a free identifier that
+/// matches a top-level definition in this document jumps within the file and
+/// ignores `base_dir`. Only when the cursor is on the MEMBER side of an
+/// `alias.member` access (and no same-file definition matched) do we fall back
+/// to cross-file resolution: resolve the alias's imported `/// @source` lib and
+/// jump to the exported symbol's name in that lib file.
+///
+/// `base_dir` mirrors `completions_at`: it is the open document's directory,
+/// used only to resolve local `/// @source` paths under the existing
+/// path-safety contract. `None` (in-memory/`untitled:` docs) disables the
+/// cross-file fallback entirely — behavior is then identical to same-file goto.
+pub fn goto_definition(
+    doc: &Document,
+    pos: Position,
+    uri: Url,
+    base_dir: Option<&std::path::Path>,
+) -> Option<GotoDefinitionResponse> {
     let byte = doc.offset_at(pos.line, pos.character);
-    let (name, _, _) = symbols::identifier_at(doc, byte)?;
-    let def = symbols::definitions(doc).into_iter().find(|d| d.name == name)?;
+
+    // Same-file path first (unchanged behavior). Note: `identifier_at` returns
+    // the identifier text regardless of whether it is a member; the same-file
+    // definition lookup simply finds nothing for a cross-file member, so we fall
+    // through to the import path below.
+    if let Some((name, _, _)) = symbols::identifier_at(doc, byte) {
+        if let Some(def) = symbols::definitions(doc).into_iter().find(|d| d.name == name) {
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri,
+                range: byte_range(doc, def.start_byte, def.end_byte),
+            }));
+        }
+    }
+
+    // Cross-file fallback: cursor on the member of `alias.member`.
+    goto_imported_member(doc, byte, base_dir)
+}
+
+/// Resolve go-to-definition into an imported `/// @source` library when the
+/// cursor sits on the MEMBER side of an `alias.member` access. Returns `None`
+/// (graceful degrade, never panics) for any of: `base_dir` absent, cursor not on
+/// an attribute member, the object is not an imported namespace, the import is
+/// Unresolved/NotFound/ParseFailed, the member is not exported, the lib re-read
+/// fails, or the path cannot be turned into a file URL.
+fn goto_imported_member(
+    doc: &Document,
+    byte: usize,
+    base_dir: Option<&std::path::Path>,
+) -> Option<GotoDefinitionResponse> {
+    let base_dir = base_dir?;
+
+    // Find the `attribute` node enclosing the cursor and confirm the cursor is
+    // on its `attribute` (member) child — never the `object` side. This mirrors
+    // symbols.rs::collect_refs's `is_member` check, so normal alias-object goto
+    // is unaffected.
+    let leaf = doc.root().named_descendant_for_byte_range(byte, byte)?;
+    let attribute = enclosing_attribute(leaf)?;
+    let object_node = attribute.child_by_field_name("object")?;
+    let member_node = attribute.child_by_field_name("attribute")?;
+    // The cursor's leaf must be the member identifier, not the object.
+    if member_node != leaf {
+        return None;
+    }
+    let src = doc.text();
+    let object = &src[object_node.start_byte()..object_node.end_byte()];
+    let member = &src[member_node.start_byte()..member_node.end_byte()];
+
+    // Resolve the import whose effective namespace is `object` under the
+    // path-safety contract (we never bypass resolve_imports).
+    let table = import_table(doc);
+    if !table
+        .entries()
+        .iter()
+        .any(|entry| entry.effective_namespace() == object)
+    {
+        return None;
+    }
+    let resolved = resolve_imports(&table, base_dir);
+    let matched = resolved
+        .entries()
+        .iter()
+        .find(|resolved| resolved.entry.effective_namespace() == object)?;
+    let ImportResolution::Resolved { path, symbols } = &matched.resolution else {
+        return None;
+    };
+    let symbol = symbols.iter().find(|symbol| symbol.name == member)?;
+
+    // The name byte offsets are in the LIB's coordinate space, so we MUST use
+    // the lib's own LineIndex (re-parse it) to convert them — using the main
+    // doc's index would give wrong rows. Re-read from the canonical `path`
+    // (never a raw @source string), preserving the path-safety contract.
+    let lib_contents = std::fs::read_to_string(path).ok()?;
+    let lib_doc = Document::parse(lib_contents)?;
+    let (start_line, start_col) = lib_doc.position_at(symbol.name_byte_start);
+    let (end_line, end_col) = lib_doc.position_at(symbol.name_byte_end);
+    let lib_uri = Url::from_file_path(path).ok()?;
+
     Some(GotoDefinitionResponse::Scalar(Location {
-        uri,
-        range: byte_range(doc, def.start_byte, def.end_byte),
+        uri: lib_uri,
+        range: Range {
+            start: Position::new(start_line, start_col),
+            end: Position::new(end_line, end_col),
+        },
     }))
+}
+
+/// Walk up from `node` to the nearest enclosing `attribute` CST node, if any.
+/// The leaf identifier under an `alias.member` cursor is the immediate child of
+/// the `attribute`, so this is at most a one-step walk in practice; the loop is
+/// defensive against deeper nesting and stops at the document root.
+fn enclosing_attribute(node: Node) -> Option<Node> {
+    let mut current = node;
+    loop {
+        if current.kind() == "attribute" {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
 }
 
 /// All references to the user symbol under the cursor.
@@ -965,7 +1074,7 @@ mod tests {
         let (ul, uc) = d.position_at(use_byte);
         let pos = Position::new(ul, uc);
 
-        assert!(goto_definition(&d, pos, uri.clone()).is_some());
+        assert!(goto_definition(&d, pos, uri.clone(), None).is_some());
         assert_eq!(references(&d, pos, uri.clone()).len(), 2);
 
         let edit = rename(&d, pos, "length".into(), uri.clone()).unwrap();
@@ -1268,5 +1377,157 @@ mod tests {
             !items.iter().any(|i| i.kind == Some(CompletionItemKind::MODULE)),
             "no MODULE items without imports"
         );
+    }
+
+    // ---- exported_detail: synthesized signature strings -----------------------
+
+    /// Build an `ExportedParam` (name, optional type, defaulted) for tests.
+    fn param(name: &str, type_name: Option<&str>, has_default: bool) -> pine_core::imports::ExportedParam {
+        pine_core::imports::ExportedParam {
+            name: name.to_string(),
+            type_name: type_name.map(str::to_string),
+            has_default,
+        }
+    }
+
+    /// Build an `ExportedSymbol`; the name byte span is irrelevant to
+    /// `exported_detail`, so it is left zeroed.
+    fn sym(name: &str, kind: ExportKind, params: Vec<pine_core::imports::ExportedParam>) -> ExportedSymbol {
+        ExportedSymbol {
+            name: name.to_string(),
+            kind,
+            params,
+            name_byte_start: 0,
+            name_byte_end: 0,
+        }
+    }
+
+    #[test]
+    fn exported_detail_function_uses_ellipsis_for_defaults() {
+        // The synthesizer has only `has_default` (no default-value text), so a
+        // defaulted param renders as `=…`, NOT `=1.0`.
+        let add = sym(
+            "add",
+            ExportKind::Function,
+            vec![
+                param("a", Some("int"), false),
+                param("b", Some("float"), true),
+            ],
+        );
+        assert_eq!(exported_detail(&add), "add(int a, float b=…)");
+    }
+
+    #[test]
+    fn exported_detail_typeless_param_omits_type() {
+        // `f(int a, c)`: the typeless `c` renders bare (no type prefix).
+        let f = sym(
+            "f",
+            ExportKind::Function,
+            vec![param("a", Some("int"), false), param("c", None, false)],
+        );
+        assert_eq!(exported_detail(&f), "f(int a, c)");
+    }
+
+    #[test]
+    fn exported_detail_type_and_enum_are_empty() {
+        let point = sym("Point", ExportKind::Type, Vec::new());
+        let color = sym("Color", ExportKind::Enum, Vec::new());
+        assert_eq!(exported_detail(&point), "");
+        assert_eq!(exported_detail(&color), "");
+    }
+
+    // ---- goto_definition: cross-file alias.member -----------------------------
+
+    #[test]
+    fn goto_on_imported_member_jumps_into_lib() {
+        // Cursor on `add` in `mu.add`, resolved against the committed fixture
+        // dir, jumps to the `add` export's name in math_utils.pine (row 3).
+        let src = "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1 as mu\nx = mu.add(1, 2.0)\n";
+        let d = doc(src);
+        let uri = Url::parse("file:///main.pine").unwrap();
+        let pos = pos_of(&d, src, "add(1, 2.0)"); // the member `add` on the use line
+        let resp = goto_definition(&d, pos, uri, Some(&libs_dir())).expect("cross-file goto");
+        let GotoDefinitionResponse::Scalar(loc) = resp else {
+            panic!("expected a scalar location");
+        };
+        assert!(
+            loc.uri.path().ends_with("math_utils.pine"),
+            "uri must point at the lib: {}",
+            loc.uri
+        );
+        // `add` is declared on row 3 (0-indexed), column 7 (`export add`).
+        assert_eq!(loc.range.start.line, 3, "row of the `add` export");
+        assert_eq!(loc.range.start.character, 7, "col of the `add` name");
+    }
+
+    #[test]
+    fn goto_on_imported_member_without_base_dir_is_none() {
+        // No base_dir -> no cross-file resolution; `add` is not a same-file
+        // symbol either, so the result is None (graceful degrade).
+        let src = "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1 as mu\nx = mu.add(1, 2.0)\n";
+        let d = doc(src);
+        let uri = Url::parse("file:///main.pine").unwrap();
+        let pos = pos_of(&d, src, "add(1, 2.0)");
+        assert!(goto_definition(&d, pos, uri, None).is_none());
+    }
+
+    #[test]
+    fn goto_same_file_still_works_with_base_dir() {
+        // A local symbol still resolves within the file even when base_dir is set.
+        let src = "//@version=6\nlen = 14\nz = len + 1\n";
+        let d = doc(src);
+        let uri = Url::parse("file:///main.pine").unwrap();
+        let use_byte = src.rfind("len").unwrap();
+        let (ul, uc) = d.position_at(use_byte);
+        let pos = Position::new(ul, uc);
+        assert!(goto_definition(&d, pos, uri, Some(&libs_dir())).is_some());
+    }
+
+    #[test]
+    fn goto_on_unexported_member_is_none() {
+        // `helper` is defined in math_utils.pine but NOT exported, so it is not
+        // in the resolved exports -> no jump.
+        let src = "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1 as mu\nx = mu.helper(1)\n";
+        let d = doc(src);
+        let uri = Url::parse("file:///main.pine").unwrap();
+        let pos = pos_of(&d, src, "helper(1)");
+        assert!(goto_definition(&d, pos, uri, Some(&libs_dir())).is_none());
+    }
+
+    #[test]
+    fn goto_on_published_import_member_is_none() {
+        // No `/// @source` (published import) -> Unresolved -> no cross-file goto
+        // even with a real base_dir.
+        let src = "//@version=6\nimport User/MathUtils/1 as mu\nx = mu.add(1, 2.0)\n";
+        let d = doc(src);
+        let uri = Url::parse("file:///main.pine").unwrap();
+        let pos = pos_of(&d, src, "add(1, 2.0)");
+        assert!(goto_definition(&d, pos, uri, Some(&libs_dir())).is_none());
+    }
+
+    #[test]
+    fn goto_on_alias_object_side_does_not_jump_into_lib() {
+        // Cursor on the OBJECT `mu` (not the member) must not be hijacked by the
+        // cross-file member path. The alias `mu` IS a same-file symbol (the
+        // import declaration), so goto resolves WITHIN the main file — never into
+        // the lib. This proves the new member path doesn't shadow alias goto.
+        let src = "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1 as mu\nx = mu.add(1, 2.0)\n";
+        let d = doc(src);
+        let uri = Url::parse("file:///main.pine").unwrap();
+        // The `mu` on the use line (line 3), distinct from the import line.
+        let use_line_byte = src.rfind("mu.add").unwrap();
+        let (ul, uc) = d.position_at(use_line_byte);
+        let pos = Position::new(ul, uc);
+        let resp = goto_definition(&d, pos, uri, Some(&libs_dir()))
+            .expect("alias goto resolves to its import in-file");
+        let GotoDefinitionResponse::Scalar(loc) = resp else {
+            panic!("expected a scalar location");
+        };
+        assert!(
+            !loc.uri.path().ends_with("math_utils.pine"),
+            "object-side cursor must stay in the main file, not jump into the lib: {}",
+            loc.uri
+        );
+        assert_eq!(loc.uri.path(), "/main.pine", "stays in the main document");
     }
 }

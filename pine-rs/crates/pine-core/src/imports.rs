@@ -309,11 +309,20 @@ pub struct ExportedParam {
 /// A single top-level exported declaration from a lib file.
 ///
 /// `params` is empty for [`ExportKind::Type`] and [`ExportKind::Enum`].
+///
+/// `name_byte_start`/`name_byte_end` are the byte offsets of the declaration's
+/// NAME identifier in the LIB source (not row/col, to keep pine-core LSP-free).
+/// The LSP converts them to a position via the lib's own `LineIndex` for
+/// go-to-definition; an in-file consumer never needs them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportedSymbol {
     pub name: String,
     pub kind: ExportKind,
     pub params: Vec<ExportedParam>,
+    /// Byte offset of the first byte of the name identifier in the lib source.
+    pub name_byte_start: usize,
+    /// Byte offset one past the last byte of the name identifier in the lib source.
+    pub name_byte_end: usize,
 }
 
 /// The outcome of resolving one import entry's `/// @source` directive.
@@ -322,7 +331,14 @@ pub enum ImportResolution {
     /// A local lib file was read + parsed; these exports were recovered. This
     /// can be returned even if the lib had parse ERROR nodes (tree-sitter still
     /// yields a tree; we collect best-effort).
-    Resolved(Vec<ExportedSymbol>),
+    ///
+    /// `path` is the canonical absolute path of the resolved lib file (the same
+    /// path-safety-checked target the resolver read), so a downstream LSP can
+    /// build a file URI / re-read the lib without re-deriving it.
+    Resolved {
+        path: std::path::PathBuf,
+        symbols: Vec<ExportedSymbol>,
+    },
     /// No `/// @source` directive (the common published-import case). NOT an
     /// error — the resolver has nothing local to read.
     Unresolved,
@@ -405,7 +421,10 @@ fn resolve_entry(entry: &ImportEntry, base_dir: &Path) -> ImportResolution {
     };
 
     match Document::parse(contents) {
-        Some(doc) => ImportResolution::Resolved(exported_symbols(&doc)),
+        Some(doc) => ImportResolution::Resolved {
+            path: target,
+            symbols: exported_symbols(&doc),
+        },
         None => ImportResolution::ParseFailed,
     }
 }
@@ -463,20 +482,28 @@ fn collect_exports(node: Node, src: &str, out: &mut Vec<ExportedSymbol>) {
             }
         }
         "type_definition_statement" if has_export_child(node) => {
-            if let Some(name) = field_identifier_text(node, "name", src) {
+            if let Some((name, name_byte_start, name_byte_end)) =
+                field_identifier_span(node, "name", src)
+            {
                 out.push(ExportedSymbol {
                     name,
                     kind: ExportKind::Type,
                     params: Vec::new(),
+                    name_byte_start,
+                    name_byte_end,
                 });
             }
         }
         "enum_declaration" if has_export_child(node) => {
-            if let Some(name) = field_identifier_text(node, "name", src) {
+            if let Some((name, name_byte_start, name_byte_end)) =
+                field_identifier_span(node, "name", src)
+            {
                 out.push(ExportedSymbol {
                     name,
                     kind: ExportKind::Enum,
                     params: Vec::new(),
+                    name_byte_start,
+                    name_byte_end,
                 });
             }
         }
@@ -497,13 +524,20 @@ fn has_export_child(node: Node) -> bool {
         .any(|child| child.kind() == "export")
 }
 
-/// Text of the `identifier`-kinded child under `field`, if present.
-fn field_identifier_text(node: Node, field: &str, src: &str) -> Option<String> {
+/// Text of the `identifier`-kinded child under `field` plus its byte span
+/// `(text, start_byte, end_byte)` in the LIB source — used to populate
+/// [`ExportedSymbol::name_byte_start`]/[`ExportedSymbol::name_byte_end`] so an
+/// LSP can jump to the exact name token.
+fn field_identifier_span(node: Node, field: &str, src: &str) -> Option<(String, usize, usize)> {
     let id = node.child_by_field_name(field)?;
     if id.kind() != "identifier" {
         return None;
     }
-    Some(src[id.start_byte()..id.end_byte()].to_string())
+    Some((
+        src[id.start_byte()..id.end_byte()].to_string(),
+        id.start_byte(),
+        id.end_byte(),
+    ))
 }
 
 /// Build an [`ExportedSymbol`] for an exported function or method declaration.
@@ -512,8 +546,8 @@ fn parse_exported_function(node: Node, src: &str) -> Option<ExportedSymbol> {
     // (mirroring symbols.rs::collect_defs). The presence of `method` decides
     // the kind.
     let is_method = node.child_by_field_name("method").is_some();
-    let name = field_identifier_text(node, "function", src)
-        .or_else(|| field_identifier_text(node, "method", src))?;
+    let (name, name_byte_start, name_byte_end) = field_identifier_span(node, "function", src)
+        .or_else(|| field_identifier_span(node, "method", src))?;
 
     let kind = if is_method {
         ExportKind::Method
@@ -525,6 +559,8 @@ fn parse_exported_function(node: Node, src: &str) -> Option<ExportedSymbol> {
         name,
         kind,
         params: collect_params(node, src),
+        name_byte_start,
+        name_byte_end,
     })
 }
 
@@ -847,5 +883,42 @@ mod tests {
         let src = "//@version=6\nindicator(\"x\")\nf(a) =>\n    a\nplot(close)\n";
         let syms = exports(src);
         assert!(syms.is_empty(), "no exports is not an error");
+    }
+
+    #[test]
+    fn exported_function_name_span_points_at_the_name() {
+        // The name byte span must slice exactly the function name out of the
+        // SAME source the symbols were extracted from.
+        let lib_src = "//@version=6\nexport add(int a, float b = 1.0) =>\n    a + b\n";
+        let syms = exports(lib_src);
+        assert_eq!(syms.len(), 1);
+        let add = &syms[0];
+        assert_eq!(
+            &lib_src[add.name_byte_start..add.name_byte_end],
+            "add",
+            "fn name span must slice the name from the lib source"
+        );
+    }
+
+    #[test]
+    fn exported_method_name_span_points_at_the_name() {
+        let lib_src = "//@version=6\nexport method scale(series float x) =>\n    x\n";
+        let syms = exports(lib_src);
+        assert_eq!(syms.len(), 1);
+        let scale = &syms[0];
+        assert_eq!(scale.kind, ExportKind::Method);
+        assert_eq!(&lib_src[scale.name_byte_start..scale.name_byte_end], "scale");
+    }
+
+    #[test]
+    fn exported_type_and_enum_name_spans_point_at_the_names() {
+        let lib_src = "//@version=6\nexport type Point\n    float x\nexport enum Color\n    red\n";
+        let syms = exports(lib_src);
+        let point = syms.iter().find(|s| s.name == "Point").expect("Point");
+        assert_eq!(point.kind, ExportKind::Type);
+        assert_eq!(&lib_src[point.name_byte_start..point.name_byte_end], "Point");
+        let color = syms.iter().find(|s| s.name == "Color").expect("Color");
+        assert_eq!(color.kind, ExportKind::Enum);
+        assert_eq!(&lib_src[color.name_byte_start..color.name_byte_end], "Color");
     }
 }

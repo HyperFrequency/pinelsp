@@ -165,10 +165,15 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri.clone();
         let pos = params.text_document_position_params.position;
+        // Cross-file go-to-definition resolves `/// @source` libs relative to the
+        // open document's directory, exactly like completion. Non-`file:` URLs
+        // yield Err -> None, degrading to same-file goto only.
+        let path = uri.to_file_path().ok();
+        let base_dir = path.as_deref().and_then(|p| p.parent());
         let docs = self.docs.lock().await;
         Ok(docs
             .get(&uri)
-            .and_then(|d| features::goto_definition(d, pos, uri.clone())))
+            .and_then(|d| features::goto_definition(d, pos, uri.clone(), base_dir)))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
