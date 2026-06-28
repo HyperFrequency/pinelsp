@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use pine_core::builtins;
+use pine_core::imports::{import_table, ImportEntry};
 use pine_core::symbols::{self, SymbolKind as DefKind};
 use pine_core::Document;
 use tower_lsp::lsp_types::*;
@@ -58,11 +59,40 @@ pub fn semantic_diagnostics(doc: &Document) -> Vec<Diagnostic> {
         .collect()
 }
 
-/// All diagnostics for a document: tree-sitter syntax errors + semantic checks.
+/// All diagnostics for a document: tree-sitter syntax errors + semantic checks
+/// + LSP-local import-resolution info.
 pub fn all_diagnostics(doc: &Document) -> Vec<Diagnostic> {
     let mut diags = syntax_diagnostics(doc);
     diags.extend(semantic_diagnostics(doc));
+    diags.extend(import_diagnostics(doc));
     diags
+}
+
+/// LSP-local INFO diagnostics for imports that lack a `/// @source` directive.
+///
+/// This lives here (not in `pine-check::analyze`) on purpose: it must NOT feed
+/// the oracle/CLI parity tests. A missing `@source` is explicitly NOT an error
+/// per the `imports` module contract — it only means cross-file IntelliSense is
+/// unavailable — so the severity is [`DiagnosticSeverity::INFORMATION`] and the
+/// diagnostic is emitted ONLY when `source.is_none()`, which makes it impossible
+/// to false-positive on a valid v6 script that simply omits the directive.
+pub fn import_diagnostics(doc: &Document) -> Vec<Diagnostic> {
+    import_table(doc)
+        .entries()
+        .iter()
+        .filter(|entry| entry.source.is_none())
+        .map(|entry| Diagnostic {
+            range: byte_range(doc, entry.start_byte, entry.end_byte),
+            severity: Some(DiagnosticSeverity::INFORMATION),
+            code: Some(NumberOrString::String("import-no-source".to_string())),
+            source: Some("pine-lsp".into()),
+            message: format!(
+                "import `{}` has no `/// @source` directive; cross-file IntelliSense unavailable",
+                entry.effective_namespace()
+            ),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// Collect ERROR/MISSING nodes, pruning subtrees that parsed cleanly.
@@ -80,11 +110,16 @@ fn collect_errors<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
     }
 }
 
-/// Hover for the builtin (function / variable / constant) under the cursor.
+/// Hover for the builtin (function / variable / constant) under the cursor, or —
+/// only when no builtin matches — for an import alias.
+///
+/// `builtin_doc` is tried FIRST so importing a name that collides with a builtin
+/// (e.g. `import .. as math`) never shadows the builtin's existing hover; the
+/// import fallback is purely additive (adds hover where there was none).
 pub fn hover_at(doc: &Document, pos: Position) -> Option<Hover> {
     let byte = doc.offset_at(pos.line, pos.character);
     let word = word_at(doc.text(), byte)?;
-    let value = builtin_doc(word)?;
+    let value = builtin_doc(word).or_else(|| import_alias_hover(doc, word))?;
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -92,6 +127,35 @@ pub fn hover_at(doc: &Document, pos: Position) -> Option<Hover> {
         }),
         range: None,
     })
+}
+
+/// Hover markdown for an import whose effective namespace (alias, or lib name
+/// when aliasless) equals `word`. `None` when no import matches `word`.
+fn import_alias_hover(doc: &Document, word: &str) -> Option<String> {
+    let table = import_table(doc);
+    let entry = table
+        .entries()
+        .iter()
+        .find(|entry| entry.effective_namespace() == word)?;
+    let mut markdown = format!(
+        "```pine\nimport {}/{}/{} as {}\n```",
+        entry.user,
+        entry.lib,
+        entry.version,
+        entry.effective_namespace()
+    );
+    match &entry.source {
+        Some(path) => {
+            markdown.push_str("\n\nSource: ");
+            markdown.push_str(path);
+        }
+        None => {
+            markdown.push_str(
+                "\n\nNo `/// @source` directive set; cross-file IntelliSense unavailable.",
+            );
+        }
+    }
+    Some(markdown)
 }
 
 fn builtin_doc(word: &str) -> Option<String> {
@@ -132,7 +196,7 @@ pub fn completions_at(doc: &Document, pos: Position) -> Vec<CompletionItem> {
     let run = trailing_run(doc.text(), byte);
     match run.rfind('.') {
         Some(dot) => namespace_members(&run[..dot]),
-        None => top_level_items(),
+        None => top_level_items(doc),
     }
 }
 
@@ -162,7 +226,7 @@ fn namespace_members(ns: &str) -> Vec<CompletionItem> {
     items
 }
 
-fn top_level_items() -> Vec<CompletionItem> {
+fn top_level_items(doc: &Document) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     for f in builtins::FUNCTIONS.iter() {
         items.push(item(f.name.clone(), CompletionItemKind::FUNCTION, fn_detail(f)));
@@ -180,7 +244,40 @@ fn top_level_items() -> Vec<CompletionItem> {
             ..Default::default()
         });
     }
+    // Additive: one MODULE item per import, keyed on the effective namespace
+    // (alias, or lib name when aliasless). Skip any alias that collides with a
+    // builtin namespace head (e.g. `ta`) so we never double-list it or disturb
+    // the existing `ta.` member-completion path.
+    for entry in import_table(doc).entries() {
+        let namespace = entry.effective_namespace();
+        if is_builtin_namespace_head(namespace) {
+            continue;
+        }
+        items.push(import_completion(entry));
+    }
     items
+}
+
+fn import_completion(entry: &ImportEntry) -> CompletionItem {
+    CompletionItem {
+        label: entry.effective_namespace().to_string(),
+        kind: Some(CompletionItemKind::MODULE),
+        detail: Some(format!(
+            "import {}/{}/{}",
+            entry.user, entry.lib, entry.version
+        )),
+        ..Default::default()
+    }
+}
+
+/// True when `name` is the head namespace of some builtin (i.e. there exists a
+/// builtin `name.<member>`). Used to avoid shadowing builtin namespaces like
+/// `ta`/`math` with import-alias completion items.
+fn is_builtin_namespace_head(name: &str) -> bool {
+    let prefix = format!("{name}.");
+    builtins::FUNCTIONS.iter().any(|f| f.name.starts_with(&prefix))
+        || builtins::VARIABLES.iter().any(|v| v.name.starts_with(&prefix))
+        || builtins::CONSTANTS.iter().any(|c| c.name.starts_with(&prefix))
 }
 
 fn item(label: String, kind: CompletionItemKind, detail: String) -> CompletionItem {
@@ -853,5 +950,161 @@ mod tests {
                 _ => panic!("expected string label"),
             }
         }
+    }
+
+    // ---- imports: hover / completion / diagnostics ----------------------------
+
+    /// Position of the first byte of `needle` in `src`, as an LSP `Position`.
+    fn pos_of(doc: &Document, src: &str, needle: &str) -> Position {
+        let byte = src.find(needle).expect("needle in src");
+        let (line, character) = doc.position_at(byte);
+        Position::new(line, character)
+    }
+
+    fn hover_markdown(h: &Hover) -> &str {
+        match &h.contents {
+            HoverContents::Markup(MarkupContent { value, .. }) => value,
+            _ => panic!("expected markup hover"),
+        }
+    }
+
+    #[test]
+    fn hover_on_import_alias_shows_library_path() {
+        let src = "//@version=6\n/// @source ./libs/a.pine\nimport User/MyLib/1 as myLib\n";
+        let d = doc(src);
+        let h = hover_at(&d, pos_of(&d, src, "myLib")).expect("hover on alias");
+        let md = hover_markdown(&h);
+        assert!(md.contains("User/MyLib/1"), "markdown: {md}");
+        assert!(md.contains("./libs/a.pine"), "markdown: {md}");
+    }
+
+    #[test]
+    fn hover_on_aliasless_import_uses_lib_name() {
+        let src = "//@version=6\nimport TV/Strategy/2\n";
+        let d = doc(src);
+        // Hover on the lib name `Strategy` (the effective namespace).
+        let h = hover_at(&d, pos_of(&d, src, "Strategy")).expect("hover on lib name");
+        let md = hover_markdown(&h);
+        assert!(md.contains("TV/Strategy/2"), "markdown: {md}");
+    }
+
+    #[test]
+    fn hover_on_import_without_source_notes_missing() {
+        let src = "//@version=6\nimport User/MyLib/1 as myLib\n";
+        let d = doc(src);
+        let h = hover_at(&d, pos_of(&d, src, "myLib")).expect("hover on alias");
+        let md = hover_markdown(&h);
+        assert!(md.contains("@source"), "should mention missing @source: {md}");
+    }
+
+    #[test]
+    fn hover_on_builtin_still_wins() {
+        let src = "//@version=6\nplot(close)\n";
+        let d = doc(src);
+        // `close` is a builtin variable; alias fallback must not change this.
+        let h = hover_at(&d, pos_of(&d, src, "close")).expect("builtin hover");
+        let md = hover_markdown(&h);
+        assert!(md.contains("close"), "builtin doc unchanged: {md}");
+        assert!(!md.contains("import"), "must be the builtin doc, not an import: {md}");
+    }
+
+    #[test]
+    fn hover_on_plain_identifier_still_none() {
+        let src = "//@version=6\nlen = 14\nplot(len)\n";
+        let d = doc(src);
+        // `len` is a user var, not a builtin and not an import → no hover.
+        assert!(hover_at(&d, pos_of(&d, src, "len")).is_none());
+    }
+
+    #[test]
+    fn completion_top_level_includes_import_alias() {
+        let d = doc("//@version=6\nimport User/MyLib/1 as myLib\n\n");
+        let items = completions_at(&d, Position::new(2, 0));
+        let alias = items
+            .iter()
+            .find(|i| i.label == "myLib")
+            .expect("myLib completion");
+        assert_eq!(alias.kind, Some(CompletionItemKind::MODULE));
+        assert!(
+            alias.detail.as_deref().unwrap_or("").contains("User/MyLib/1"),
+            "detail: {:?}",
+            alias.detail
+        );
+    }
+
+    #[test]
+    fn completion_alias_not_duplicated_for_builtin_namespace() {
+        // An import aliased `ta` collides with the builtin `ta.` namespace head.
+        let d = doc("//@version=6\nimport User/MyLib/1 as ta\n\n");
+        let top = completions_at(&d, Position::new(2, 0));
+        // No MODULE item named `ta` was added (the builtin namespace is untouched).
+        assert!(
+            !top.iter()
+                .any(|i| i.label == "ta" && i.kind == Some(CompletionItemKind::MODULE)),
+            "must not add a spurious `ta` MODULE item"
+        );
+        // The existing post-dot `ta.` member completion still works.
+        let d2 = doc("//@version=6\nimport User/MyLib/1 as ta\nx = ta.\n");
+        let members = completions_at(&d2, Position::new(2, 7));
+        assert!(members.iter().any(|i| i.label == "sma"), "ta.sma still resolves");
+    }
+
+    #[test]
+    fn completion_after_dot_unchanged() {
+        // `myLib.` must NOT invent members — member resolution is out of scope.
+        let src = "//@version=6\nimport User/MyLib/1 as myLib\nx = myLib.\n";
+        let d = doc(src);
+        let after_dot = completions_at(&d, Position::new(2, 10));
+        // `myLib` is not a builtin namespace, so namespace_members finds nothing.
+        assert!(after_dot.is_empty(), "no fabricated members for `myLib.`");
+    }
+
+    #[test]
+    fn import_diagnostics_info_for_missing_source() {
+        let d = doc("//@version=6\nimport User/MyLib/1 as myLib\n");
+        let diags = import_diagnostics(&d);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::INFORMATION));
+        assert_eq!(
+            diags[0].code,
+            Some(NumberOrString::String("import-no-source".to_string()))
+        );
+        // Range covers the import line (row 1).
+        assert_eq!(diags[0].range.start.line, 1);
+        assert_eq!(diags[0].range.end.line, 1);
+    }
+
+    #[test]
+    fn import_diagnostics_none_when_source_present() {
+        let d = doc("//@version=6\n/// @source ./libs/a.pine\nimport User/MyLib/1 as myLib\n");
+        assert!(import_diagnostics(&d).is_empty());
+    }
+
+    #[test]
+    fn all_diagnostics_merges_import_info_without_dropping_others() {
+        // Missing @source (INFO) AND a syntax error (ERROR) must both surface.
+        let d = doc("//@version=6\nimport User/MyLib/1 as myLib\nx = (1 + \n");
+        let diags = all_diagnostics(&d);
+        assert!(
+            diags.iter().any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "syntax ERROR must remain"
+        );
+        assert!(
+            diags.iter().any(|d| d.code
+                == Some(NumberOrString::String("import-no-source".to_string()))),
+            "import-no-source INFO must be merged"
+        );
+    }
+
+    #[test]
+    fn no_import_no_diagnostics_no_completion_change() {
+        // A plain indicator/plot doc with zero imports: additive-only proof.
+        let d = doc("//@version=6\nindicator(\"x\")\nplot(close)\n");
+        assert!(import_diagnostics(&d).is_empty());
+        let items = completions_at(&d, Position::new(3, 0));
+        assert!(
+            !items.iter().any(|i| i.kind == Some(CompletionItemKind::MODULE)),
+            "no MODULE items without imports"
+        );
     }
 }
