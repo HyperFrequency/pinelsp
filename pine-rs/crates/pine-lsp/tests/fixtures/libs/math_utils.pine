@@ -1,0 +1,12 @@
+//@version=6
+// A small exported-function library used by the pine-lsp completion tests.
+
+export add(int a, float b = 1.0) =>
+    a + b
+
+export clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+// Not exported: must be excluded from member completion.
+helper(c) =>
+    c * 2

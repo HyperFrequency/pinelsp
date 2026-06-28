@@ -139,10 +139,15 @@ impl LanguageServer for Backend {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
+        // Cross-file member completion resolves `/// @source` libs relative to
+        // the open document's directory. Non-`file:` URLs (e.g. `untitled:`)
+        // yield Err -> None, degrading gracefully to builtin-only completion.
+        let path = uri.to_file_path().ok();
+        let base_dir = path.as_deref().and_then(|p| p.parent());
         let docs = self.docs.lock().await;
         let items = docs
             .get(&uri)
-            .map(|d| features::completions_at(d, pos))
+            .map(|d| features::completions_at(d, pos, base_dir))
             .unwrap_or_default();
         Ok(Some(CompletionResponse::Array(items)))
     }

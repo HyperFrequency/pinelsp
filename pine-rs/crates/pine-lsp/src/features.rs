@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 
 use pine_core::builtins;
-use pine_core::imports::{import_table, ImportEntry};
+use pine_core::imports::{
+    import_table, resolve_imports, ExportKind, ExportedSymbol, ImportEntry, ImportResolution,
+};
 use pine_core::symbols::{self, SymbolKind as DefKind};
 use pine_core::Document;
 use tower_lsp::lsp_types::*;
@@ -173,12 +175,115 @@ fn builtin_doc(word: &str) -> Option<String> {
 
 /// Completions: members of `namespace.` after a dot, otherwise all top-level
 /// builtins + keywords.
-pub fn completions_at(doc: &Document, pos: Position) -> Vec<CompletionItem> {
+///
+/// `base_dir` is the directory of the open document (derived from its file
+/// URL by the Backend), used only to resolve `/// @source` library imports for
+/// cross-file member completion. Passing `None` (e.g. an `untitled:`/in-memory
+/// doc, or any non-`file:` URL) reproduces the builtin-only behavior exactly:
+/// no filesystem access and no cross-file members. Cross-file resolution fires
+/// strictly on the post-`.` branch, so top-level completion stays fs-free.
+pub fn completions_at(
+    doc: &Document,
+    pos: Position,
+    base_dir: Option<&std::path::Path>,
+) -> Vec<CompletionItem> {
     let byte = doc.offset_at(pos.line, pos.character);
     let run = trailing_run(doc.text(), byte);
     match run.rfind('.') {
-        Some(dot) => namespace_members(&run[..dot]),
+        Some(dot) => {
+            let namespace = &run[..dot];
+            // Builtin namespace members (e.g. `ta.`, `math.`) run first and
+            // unconditionally, so this branch never regresses builtins.
+            let mut items = namespace_members(namespace);
+            // Additively append exported symbols of an imported library whose
+            // effective namespace equals `namespace`. Skipped entirely when no
+            // directory is known (graceful degrade for in-memory docs).
+            if let Some(dir) = base_dir {
+                append_imported_members(doc, namespace, dir, &mut items);
+            }
+            items
+        }
         None => top_level_items(doc),
+    }
+}
+
+/// Resolve `namespace`'s imported library (if any) and append its exported
+/// symbols to `items`. No-op unless an import entry's effective namespace
+/// matches `namespace` AND its `/// @source` resolved successfully. Uses
+/// `effective_namespace` (not `by_alias`) so aliasless imports — whose
+/// namespace falls back to the lib name — also resolve.
+fn append_imported_members(
+    doc: &Document,
+    namespace: &str,
+    base_dir: &std::path::Path,
+    items: &mut Vec<CompletionItem>,
+) {
+    let table = import_table(doc);
+    // Cheap guard: only touch the filesystem when an import actually claims
+    // this namespace. Published/unresolved imports still go through
+    // resolve_imports below but yield Unresolved -> nothing appended.
+    if !table
+        .entries()
+        .iter()
+        .any(|entry| entry.effective_namespace() == namespace)
+    {
+        return;
+    }
+    // resolve_imports enforces the path-safety contract (refuses absolute /
+    // escaping `@source` paths, canonicalizes under base_dir); we never bypass
+    // it. Missing/escaping/parse-failed sources yield no members, not a panic.
+    let resolved = resolve_imports(&table, base_dir);
+    let Some(matched) = resolved
+        .entries()
+        .iter()
+        .find(|resolved| resolved.entry.effective_namespace() == namespace)
+    else {
+        return;
+    };
+    if let ImportResolution::Resolved(symbols) = &matched.resolution {
+        for symbol in symbols {
+            items.push(exported_item(symbol));
+        }
+    }
+}
+
+/// Map an [`ExportedSymbol`] to a bare-member [`CompletionItem`] (label is the
+/// symbol name with no namespace prefix, consistent with builtin
+/// `namespace_members`).
+fn exported_item(symbol: &ExportedSymbol) -> CompletionItem {
+    let kind = match symbol.kind {
+        ExportKind::Function | ExportKind::Method => CompletionItemKind::FUNCTION,
+        ExportKind::Type => CompletionItemKind::STRUCT,
+        ExportKind::Enum => CompletionItemKind::ENUM,
+    };
+    item(symbol.name.clone(), kind, exported_detail(symbol))
+}
+
+/// A synthesized one-line signature for an exported fn/method
+/// (`name(type a, type b=…)`); empty for types and enums (which carry no
+/// params), mirroring how `fn_detail` renders builtin signatures.
+fn exported_detail(symbol: &ExportedSymbol) -> String {
+    match symbol.kind {
+        ExportKind::Function | ExportKind::Method => {
+            let params = symbol
+                .params
+                .iter()
+                .map(|param| {
+                    let typed = match &param.type_name {
+                        Some(type_name) => format!("{type_name} {}", param.name),
+                        None => param.name.clone(),
+                    };
+                    if param.has_default {
+                        format!("{typed}=…")
+                    } else {
+                        typed
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({})", symbol.name, params)
+        }
+        ExportKind::Type | ExportKind::Enum => String::new(),
     }
 }
 
@@ -818,7 +923,7 @@ mod tests {
     fn completion_after_dot_lists_namespace_members() {
         let d = doc("//@version=6\nx = ta.\n");
         // cursor right after "ta." → line 1, char 7
-        let items = completions_at(&d, Position::new(1, 7));
+        let items = completions_at(&d, Position::new(1, 7), None);
         assert!(items.iter().any(|i| i.label == "sma"), "expected ta.sma");
         assert!(items.iter().all(|i| !i.label.contains('.')), "members are bare");
     }
@@ -826,7 +931,7 @@ mod tests {
     #[test]
     fn completion_top_level_includes_builtins_and_keywords() {
         let d = doc("//@version=6\n\n");
-        let items = completions_at(&d, Position::new(1, 0));
+        let items = completions_at(&d, Position::new(1, 0), None);
         assert!(items.iter().any(|i| i.label == "close"));
         assert!(items.iter().any(|i| i.label == "if"));
         assert!(items.len() > 400);
@@ -1002,7 +1107,7 @@ mod tests {
     #[test]
     fn completion_top_level_includes_import_alias() {
         let d = doc("//@version=6\nimport User/MyLib/1 as myLib\n\n");
-        let items = completions_at(&d, Position::new(2, 0));
+        let items = completions_at(&d, Position::new(2, 0), None);
         let alias = items
             .iter()
             .find(|i| i.label == "myLib")
@@ -1019,7 +1124,7 @@ mod tests {
     fn completion_alias_not_duplicated_for_builtin_namespace() {
         // An import aliased `ta` collides with the builtin `ta.` namespace head.
         let d = doc("//@version=6\nimport User/MyLib/1 as ta\n\n");
-        let top = completions_at(&d, Position::new(2, 0));
+        let top = completions_at(&d, Position::new(2, 0), None);
         // No MODULE item named `ta` was added (the builtin namespace is untouched).
         assert!(
             !top.iter()
@@ -1028,18 +1133,106 @@ mod tests {
         );
         // The existing post-dot `ta.` member completion still works.
         let d2 = doc("//@version=6\nimport User/MyLib/1 as ta\nx = ta.\n");
-        let members = completions_at(&d2, Position::new(2, 7));
+        let members = completions_at(&d2, Position::new(2, 7), None);
         assert!(members.iter().any(|i| i.label == "sma"), "ta.sma still resolves");
     }
 
     #[test]
     fn completion_after_dot_unchanged() {
-        // `myLib.` must NOT invent members — member resolution is out of scope.
+        // With no `base_dir` (`None`), `myLib.` must NOT invent members: no path
+        // means no cross-file resolution, and `myLib` is not a builtin namespace
+        // so `namespace_members` finds nothing. This proves the graceful
+        // degrade for in-memory/`untitled:` docs.
         let src = "//@version=6\nimport User/MyLib/1 as myLib\nx = myLib.\n";
         let d = doc(src);
-        let after_dot = completions_at(&d, Position::new(2, 10));
-        // `myLib` is not a builtin namespace, so namespace_members finds nothing.
-        assert!(after_dot.is_empty(), "no fabricated members for `myLib.`");
+        let after_dot = completions_at(&d, Position::new(2, 10), None);
+        assert!(after_dot.is_empty(), "no fabricated members for `myLib.` with no path");
+    }
+
+    /// The committed fixture-lib directory used as the resolver's `base_dir`,
+    /// resolved relative to `CARGO_MANIFEST_DIR` (matching pine-core's
+    /// resolve_imports tests). Deterministic; no temp files.
+    fn libs_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/libs")
+    }
+
+    #[test]
+    fn completion_after_dot_resolves_imported_lib_members() {
+        // `/// @source math_utils.pine` + `as mu`, cursor after `mu.`, resolved
+        // against the committed fixture dir: the lib's EXPORTED fns appear as
+        // bare FUNCTION items; the non-exported `helper` does not.
+        let src = "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1 as mu\nx = mu.\n";
+        let d = doc(src);
+        let items = completions_at(&d, Position::new(3, 7), Some(&libs_dir()));
+        let add = items
+            .iter()
+            .find(|i| i.label == "add")
+            .expect("exported `add` member");
+        assert_eq!(add.kind, Some(CompletionItemKind::FUNCTION));
+        assert!(items.iter().any(|i| i.label == "clamp"), "exported `clamp` member");
+        assert!(
+            !items.iter().any(|i| i.label == "helper"),
+            "non-exported `helper` must be absent"
+        );
+        assert!(items.iter().all(|i| !i.label.contains('.')), "members are bare");
+    }
+
+    #[test]
+    fn completion_after_dot_no_path_degrades() {
+        // Same source, but `base_dir = None`: no cross-file members, no panic.
+        let src = "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1 as mu\nx = mu.\n";
+        let d = doc(src);
+        let items = completions_at(&d, Position::new(3, 7), None);
+        assert!(
+            !items.iter().any(|i| i.label == "add" || i.label == "clamp"),
+            "no cross-file members without a path"
+        );
+    }
+
+    #[test]
+    fn completion_after_dot_published_import_no_members() {
+        // No `/// @source` (published import) + a real base_dir -> Unresolved ->
+        // nothing extra appended.
+        let src = "//@version=6\nimport User/MathUtils/1 as mu\nx = mu.\n";
+        let d = doc(src);
+        let items = completions_at(&d, Position::new(2, 7), Some(&libs_dir()));
+        assert!(
+            !items.iter().any(|i| i.label == "add" || i.label == "clamp"),
+            "published import resolves no local members"
+        );
+    }
+
+    #[test]
+    fn completion_after_dot_missing_source_file_no_panic() {
+        // `@source` names a file that does not exist -> NotFound -> empty, no panic.
+        let src = "//@version=6\n/// @source does-not-exist.pine\nimport User/MathUtils/1 as mu\nx = mu.\n";
+        let d = doc(src);
+        let items = completions_at(&d, Position::new(3, 7), Some(&libs_dir()));
+        assert!(
+            !items.iter().any(|i| i.label == "add" || i.label == "clamp"),
+            "missing @source file yields no members"
+        );
+    }
+
+    #[test]
+    fn completion_aliasless_import_members_resolve() {
+        // Aliasless import: effective_namespace falls back to the lib name
+        // (`MathUtils`). Proves the `effective_namespace` match path (NOT
+        // `by_alias`, which only matches explicit aliases).
+        let src = "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1\nx = MathUtils.\n";
+        let d = doc(src);
+        let items = completions_at(&d, Position::new(3, 14), Some(&libs_dir()));
+        assert!(items.iter().any(|i| i.label == "add"), "aliasless `add` resolves");
+        assert!(items.iter().any(|i| i.label == "clamp"), "aliasless `clamp` resolves");
+    }
+
+    #[test]
+    fn completion_builtin_namespace_still_works_with_base_dir() {
+        // `ta.` with a real base_dir still lists builtin members: the additive
+        // import path does not regress builtin member completion.
+        let d = doc("//@version=6\nx = ta.\n");
+        let items = completions_at(&d, Position::new(1, 7), Some(&libs_dir()));
+        assert!(items.iter().any(|i| i.label == "sma"), "builtin `ta.sma` still listed");
     }
 
     #[test]
@@ -1070,7 +1263,7 @@ mod tests {
     fn no_import_no_diagnostics_no_completion_change() {
         // A plain indicator/plot doc with zero imports: additive-only proof.
         let d = doc("//@version=6\nindicator(\"x\")\nplot(close)\n");
-        let items = completions_at(&d, Position::new(3, 0));
+        let items = completions_at(&d, Position::new(3, 0), None);
         assert!(
             !items.iter().any(|i| i.kind == Some(CompletionItemKind::MODULE)),
             "no MODULE items without imports"
