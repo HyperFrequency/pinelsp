@@ -280,15 +280,24 @@ mod tests {
     #[test]
     fn derive_marks_ta_sma_required_run() {
         let f = function("ta.sma").expect("ta.sma present");
-        assert!(param("source", f).required, "ta.sma source should be required");
-        assert!(param("length", f).required, "ta.sma length should be required");
+        assert!(
+            param("source", f).required,
+            "ta.sma source should be required"
+        );
+        assert!(
+            param("length", f).required,
+            "ta.sma length should be required"
+        );
     }
 
     #[test]
     fn derive_stops_at_optional_tail() {
         // ta.change: source required, length optional ("Optional. The default is...").
         let change = function("ta.change").expect("ta.change present");
-        assert!(param("source", change).required, "ta.change source required");
+        assert!(
+            param("source", change).required,
+            "ta.change source required"
+        );
         assert!(
             !param("length", change).required,
             "ta.change length is optional, must not be marked required"

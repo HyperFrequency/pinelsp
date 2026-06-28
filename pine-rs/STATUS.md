@@ -7,18 +7,18 @@ grammar binding set. Branch: `feat/rust-server`.
 ## Proof (verified)
 
 - **Workspace:** 7 crates — `tree-sitter-pine`, `pine-data-codegen`, `pine-core`,
-  `pine-check`, `pine-lsp`, `pine-cli`, `pine-mcp`. `cargo test` → **156 passing**.
+  `pine-check`, `pine-lsp`, `pine-cli`, `pine-mcp`. `cargo test` → **162 passing**.
 - **Builtins:** 457 functions / 90 variables / 237 constants / 28 keywords,
   embedded from the canonical TS pine-data.
 - **LSP (14 providers, server-verified over stdio):** completion, hover,
   signature help, diagnostics, definition, references, rename (+prepare),
   document & workspace symbols, folding, inlay hints, semantic tokens,
   formatting, code actions. INCREMENTAL sync via tree-sitter `InputEdit`.
-- **Checker — oracle parity 6/7, 0 false positives** vs TradingView
+- **Checker — oracle parity 7/7, 0 false positives** vs TradingView
   `translate_light` (`scripts/differential.py`): undefined-identifier,
   type-mismatch, unknown-argument, too-many-arguments, na-comparison,
-  missing-argument (data-gated), version, unused-variable. FP-hardened against a
-  42-fixture corpus.
+  missing-argument (`ta.*`/`math.*`, required-ness derived from param defaults),
+  version, unused-variable. FP-hardened against a 42-fixture corpus.
 - **Logic-lint (the zelosleone gap, now in Rust):** repainting `lookahead-bias`,
   `future-leak` (negative history), `strategy-no-orders` (Info), `strategy-no-exit`
   (Info), `ta-in-conditional` series-consistency (Warning), `constant-condition`
@@ -53,15 +53,15 @@ grammar binding set. Branch: `feat/rust-server`.
   (no dotnet SDK). Swift `swift test` needs XCTest (Xcode), though `swift build`
   passes.
 - **Checker full parity:** TS has ~40 checks; the highest-value ones are ported.
-  `missing-argument` is correct but gated by pine-data's `required` flags (only
-  28/457 functions mark any param required). Remaining (ternary/logical operand
-  types, special-cases) tracked.
-- **Grammar v6 completeness:** 41/42 syntax fixtures parse clean (block comments,
-  nested generics `<array<float>>`, enum integer values, leading-operator line
-  continuation `?`/`:`/`.`, tuple-declaration RHS `[a,b] = expr`, and indentation
-  edge cases now fixed). The residual 1 is `keywords-as-params` (context-keywords
-  used as parameter names) — a grammar-level keyword-extraction issue matching a
-  documented limitation of the original TS parser.
+  `missing-argument` now fires for `ta.*`/`math.*` builtins (required-ness derived
+  from absent parameter defaults in `pine-data-codegen`, oracle case caught, 0 FP);
+  other namespaces' required-ness stays upstream-data-gated. Remaining
+  (ternary/logical operand types, special-cases) tracked.
+- **Grammar v6 completeness: 42/42 — all fixtures parse clean.** Fixed across the
+  iterations: block comments, nested generics `<array<float>>`, enum integer
+  values, leading-operator line continuation `?`/`:`/`.`, tuple-declaration RHS
+  `[a,b] = expr`, indentation edge cases, and soft-keyword identifiers
+  (`type`/`series`/`simple`/`const` in expression position). No residual.
 - **Imports / multi-file IntelliSense** (`/// @source`): COMPLETE pipeline —
   parse → resolve → IntelliSense. `pine-core::imports`/`resolve_imports` parse and
   resolve local `@source` libs (path-traversal-safe); `pine-lsp` provides hover,
@@ -72,7 +72,7 @@ grammar binding set. Branch: `feat/rust-server`.
 ## Try it
 
 ```bash
-cd pine-rs && cargo test                      # 156 tests
+cd pine-rs && cargo test                      # 162 tests
 cargo run -p pine-cli -- some.pine            # lint
 python3 scripts/differential.py              # oracle parity
 # VS Code: set "pine.rustServerPath" to target/release/pine-lsp
