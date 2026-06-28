@@ -1,8 +1,11 @@
 [package]
 name = "pine-mcp"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
 description = "Pine Script v6 MCP server (validate / lookup / list / format)"
 
 [[bin]]

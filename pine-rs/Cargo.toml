@@ -14,8 +14,16 @@ members = [
 # Crates added in later phases (pine-data-codegen, pine-check, pine-lsp,
 # pine-mcp, pine-cli) join `members` as they land.
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/folknor/pinescript-vscode-extension"
+description = "Pine Script v6 Rust toolchain (parser, checker, LSP, CLI, MCP)"
+keywords = ["pine", "pinescript", "tradingview", "lsp", "tree-sitter"]
+categories = ["parser-implementations", "development-tools"]
+# MSRV: edition 2024 needs >=1.85; the let-chains used in pine-check are
+# stabilized in 1.88, so 1.88 is the true floor for the workspace.
+rust-version = "1.88"
 
 [workspace.dependencies]
 tree-sitter = "0.26"

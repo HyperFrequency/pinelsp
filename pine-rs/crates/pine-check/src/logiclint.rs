@@ -3,7 +3,7 @@
 //! errors — TradingView doesn't report them — but they catch the correctness
 //! pitfalls that make Pine strategies look better in hindsight than live.
 
-use crate::{dotted, Diagnostic, Severity};
+use crate::{Diagnostic, Severity, dotted};
 use pine_core::Document;
 use std::collections::HashSet;
 use tree_sitter::Node;
@@ -106,23 +106,21 @@ fn check_ta_stateful_in_conditional(node: Node, src: &str, out: &mut Vec<Diagnos
 /// Recurse through `node` collecting stateful `ta.*` calls, but stop descending
 /// at any nested conditional (its own visit will report its calls).
 fn collect_direct_stateful_ta(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
-    if node.kind() == "call" {
-        if let Some(func) = node.child_by_field_name("function") {
-            if let Some(name) = dotted(func, src) {
-                if STATEFUL_TA.contains(&name.as_str()) {
-                    out.push(Diagnostic {
-                        start_byte: node.start_byte(),
-                        end_byte: node.end_byte(),
-                        severity: Severity::Warning,
-                        code: "ta-conditional",
-                        message: format!(
-                            "`{name}` is stateful and should be called on every bar; \
-                             calling it only inside a conditional can make its series inconsistent"
-                        ),
-                    });
-                }
-            }
-        }
+    if node.kind() == "call"
+        && let Some(func) = node.child_by_field_name("function")
+        && let Some(name) = dotted(func, src)
+        && STATEFUL_TA.contains(&name.as_str())
+    {
+        out.push(Diagnostic {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            severity: Severity::Warning,
+            code: "ta-conditional",
+            message: format!(
+                "`{name}` is stateful and should be called on every bar; \
+                 calling it only inside a conditional can make its series inconsistent"
+            ),
+        });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -339,22 +337,21 @@ fn scan_strategy<'a>(node: Node<'a>, src: &str, scan: &mut StrategyScan<'a>) {
     if node.kind() == "import" {
         scan.has_import = true;
     }
-    if node.kind() == "call" {
-        if let Some(func) = node.child_by_field_name("function") {
-            if let Some(name) = dotted(func, src) {
-                if name == "strategy" && scan.strategy_decl.is_none() && is_top_level_call(node) {
-                    scan.strategy_decl = Some(node);
-                }
-                if ORDER_CALLS.contains(&name.as_str()) {
-                    scan.has_order = true;
-                }
-                if ENTRY_CALLS.contains(&name.as_str()) {
-                    scan.entry_count += 1;
-                }
-                if EXIT_CALLS.contains(&name.as_str()) {
-                    scan.has_exit = true;
-                }
-            }
+    if node.kind() == "call"
+        && let Some(func) = node.child_by_field_name("function")
+        && let Some(name) = dotted(func, src)
+    {
+        if name == "strategy" && scan.strategy_decl.is_none() && is_top_level_call(node) {
+            scan.strategy_decl = Some(node);
+        }
+        if ORDER_CALLS.contains(&name.as_str()) {
+            scan.has_order = true;
+        }
+        if ENTRY_CALLS.contains(&name.as_str()) {
+            scan.entry_count += 1;
+        }
+        if EXIT_CALLS.contains(&name.as_str()) {
+            scan.has_exit = true;
         }
     }
     let mut cursor = node.walk();
@@ -431,10 +428,10 @@ fn find_arg<'a>(args: Node<'a>, name: &str, pos_index: usize, src: &str) -> Opti
     let mut found = None;
     for child in args.named_children(&mut cursor) {
         if child.kind() == "keyword_argument" {
-            if let Some(key) = child.child_by_field_name("key") {
-                if &src[key.start_byte()..key.end_byte()] == name {
-                    return child.child_by_field_name("value");
-                }
+            if let Some(key) = child.child_by_field_name("key")
+                && &src[key.start_byte()..key.end_byte()] == name
+            {
+                return child.child_by_field_name("value");
             }
         } else {
             if positional == pos_index {
@@ -460,14 +457,26 @@ mod tests {
 
     #[test]
     fn flags_lookahead_on() {
-        let d = doc("//@version=6\nindicator(\"x\")\nx = request.security(syminfo.tickerid, \"D\", close, lookahead=barmerge.lookahead_on)\nplot(x)\n");
-        assert!(crate::analyze(&d).iter().any(|x| x.code == "lookahead-bias"));
+        let d = doc(
+            "//@version=6\nindicator(\"x\")\nx = request.security(syminfo.tickerid, \"D\", close, lookahead=barmerge.lookahead_on)\nplot(x)\n",
+        );
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|x| x.code == "lookahead-bias")
+        );
     }
 
     #[test]
     fn no_warning_when_lookahead_off() {
-        let d = doc("//@version=6\nindicator(\"x\")\nx = request.security(syminfo.tickerid, \"D\", close, lookahead=barmerge.lookahead_off)\nplot(x)\n");
-        assert!(!crate::analyze(&d).iter().any(|x| x.code == "lookahead-bias"));
+        let d = doc(
+            "//@version=6\nindicator(\"x\")\nx = request.security(syminfo.tickerid, \"D\", close, lookahead=barmerge.lookahead_off)\nplot(x)\n",
+        );
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|x| x.code == "lookahead-bias")
+        );
     }
 
     #[test]
@@ -481,60 +490,95 @@ mod tests {
     #[test]
     fn flags_strategy_without_orders() {
         let d = doc("//@version=6\nstrategy(\"S\")\nplot(close)\n");
-        assert!(crate::analyze(&d)
-            .iter()
-            .any(|x| x.code == "strategy-no-orders" && x.severity == Severity::Info));
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|x| x.code == "strategy-no-orders" && x.severity == Severity::Info)
+        );
     }
 
     #[test]
     fn flags_strategy_with_signal_var_but_no_order() {
-        let d = doc("//@version=6\nstrategy(\"S\")\nlongCond = ta.crossover(close, open)\nplot(close)\n");
-        assert!(crate::analyze(&d).iter().any(|x| x.code == "strategy-no-orders"));
+        let d = doc(
+            "//@version=6\nstrategy(\"S\")\nlongCond = ta.crossover(close, open)\nplot(close)\n",
+        );
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|x| x.code == "strategy-no-orders")
+        );
     }
 
     #[test]
     fn strategy_with_guarded_entry_not_flagged() {
         // entry present, even though guarded by an `if`
-        let d = doc("//@version=6\nstrategy(\"S\")\nif close > open\n    strategy.entry(\"L\", strategy.long)\n");
-        assert!(!crate::analyze(&d).iter().any(|x| x.code == "strategy-no-orders"));
+        let d = doc(
+            "//@version=6\nstrategy(\"S\")\nif close > open\n    strategy.entry(\"L\", strategy.long)\n",
+        );
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|x| x.code == "strategy-no-orders")
+        );
     }
 
     #[test]
     fn indicator_never_flagged_strategy_no_orders() {
         let d = doc("//@version=6\nindicator(\"x\")\nplot(close)\n");
-        assert!(!crate::analyze(&d).iter().any(|x| x.code == "strategy-no-orders"));
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|x| x.code == "strategy-no-orders")
+        );
     }
 
     // --- ta-stateful-in-conditional (Warning) ---
 
     #[test]
     fn flags_ta_rsi_in_if_body() {
-        let d = doc("//@version=6\nindicator(\"x\")\nif close > open\n    myrsi = ta.rsi(close, 14)\n    plot(myrsi)\n");
-        assert!(crate::analyze(&d)
-            .iter()
-            .any(|x| x.code == "ta-conditional" && x.message.contains("ta.rsi")));
+        let d = doc(
+            "//@version=6\nindicator(\"x\")\nif close > open\n    myrsi = ta.rsi(close, 14)\n    plot(myrsi)\n",
+        );
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|x| x.code == "ta-conditional" && x.message.contains("ta.rsi"))
+        );
     }
 
     #[test]
     fn flags_ta_sma_in_for_body() {
         let d = doc("//@version=6\nindicator(\"x\")\nfor i = 0 to 5\n    s = ta.sma(close, 14)\n");
-        assert!(crate::analyze(&d)
-            .iter()
-            .any(|x| x.code == "ta-conditional" && x.message.contains("ta.sma")));
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|x| x.code == "ta-conditional" && x.message.contains("ta.sma"))
+        );
     }
 
     #[test]
     fn ta_rsi_unconditional_not_flagged() {
-        let d = doc("//@version=6\nindicator(\"x\")\nmyrsi = ta.rsi(close, 14)\nplot(close > open ? myrsi : na)\n");
-        assert!(!crate::analyze(&d).iter().any(|x| x.code == "ta-conditional"));
+        let d = doc(
+            "//@version=6\nindicator(\"x\")\nmyrsi = ta.rsi(close, 14)\nplot(close > open ? myrsi : na)\n",
+        );
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|x| x.code == "ta-conditional")
+        );
     }
 
     #[test]
     fn ta_crossover_in_condition_not_flagged() {
         // ta.crossover is excluded from the allowlist AND it sits in the
         // condition, not the body.
-        let d = doc("//@version=6\nindicator(\"x\")\nif ta.crossover(close, open)\n    plot(close)\n");
-        assert!(!crate::analyze(&d).iter().any(|x| x.code == "ta-conditional"));
+        let d =
+            doc("//@version=6\nindicator(\"x\")\nif ta.crossover(close, open)\n    plot(close)\n");
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|x| x.code == "ta-conditional")
+        );
     }
 
     #[test]
@@ -548,7 +592,10 @@ mod tests {
             .iter()
             .filter(|x| x.code == "ta-conditional")
             .count();
-        assert_eq!(hits, 1, "ta.rsi in nested if should be reported exactly once");
+        assert_eq!(
+            hits, 1,
+            "ta.rsi in nested if should be reported exactly once"
+        );
     }
 
     // --- self-assignment (Warning) ---
@@ -556,35 +603,45 @@ mod tests {
     #[test]
     fn flags_self_assignment() {
         let d = doc("//@version=6\nindicator(\"x\")\nx = 1\nx := x\nplot(x)\n");
-        assert!(crate::analyze(&d).iter().any(|diag| diag.code == "self-assignment"
-            && diag.severity == Severity::Warning
-            && diag.message.contains("x := x")));
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "self-assignment"
+                    && diag.severity == Severity::Warning
+                    && diag.message.contains("x := x"))
+        );
     }
 
     #[test]
     fn flags_self_assignment_other_name() {
         let d = doc("//@version=6\nindicator(\"x\")\nlen = 14\nlen := len\nplot(close)\n");
-        assert!(crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "self-assignment"));
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "self-assignment")
+        );
     }
 
     #[test]
     fn compound_self_assignment_not_flagged() {
         // `x += x` doubles x — semantically meaningful, not a no-op.
         let d = doc("//@version=6\nindicator(\"x\")\nx = 1\nx += x\nplot(x)\n");
-        assert!(!crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "self-assignment"));
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "self-assignment")
+        );
     }
 
     #[test]
     fn self_assignment_with_expr_value_not_flagged() {
         // RHS is a math_operation, not a bare identifier.
         let d = doc("//@version=6\nindicator(\"x\")\nx = 1\nx := x + 1\nplot(x)\n");
-        assert!(!crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "self-assignment"));
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "self-assignment")
+        );
     }
 
     // --- strategy-no-exit (Info) ---
@@ -594,52 +651,71 @@ mod tests {
         let d = doc(
             "//@version=6\nstrategy(\"S\")\nif close > open\n    strategy.entry(\"L\", strategy.long)\n",
         );
-        assert!(crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "strategy-no-exit" && diag.severity == Severity::Info));
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "strategy-no-exit" && diag.severity == Severity::Info)
+        );
     }
 
     #[test]
     fn flags_strategy_no_exit_top_level_entry() {
-        let d =
-            doc("//@version=6\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\nplot(close)\n");
-        assert!(crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "strategy-no-exit" && diag.severity == Severity::Info));
+        let d = doc(
+            "//@version=6\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\nplot(close)\n",
+        );
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "strategy-no-exit" && diag.severity == Severity::Info)
+        );
     }
 
     #[test]
     fn strategy_with_exit_not_flagged_no_exit() {
-        let d = doc("//@version=6\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\nstrategy.exit(\"X\", \"L\", stop=low)\n");
-        assert!(!crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "strategy-no-exit"));
+        let d = doc(
+            "//@version=6\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\nstrategy.exit(\"X\", \"L\", stop=low)\n",
+        );
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "strategy-no-exit")
+        );
     }
 
     #[test]
     fn two_entries_reverse_exit_not_flagged() {
         // Two entries = reverse-exit pattern (close long by opening short).
-        let d = doc("//@version=6\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\nstrategy.entry(\"S\", strategy.short)\n");
-        assert!(!crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "strategy-no-exit"));
+        let d = doc(
+            "//@version=6\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\nstrategy.entry(\"S\", strategy.short)\n",
+        );
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "strategy-no-exit")
+        );
     }
 
     #[test]
     fn indicator_never_flagged_strategy_no_exit() {
         let d = doc("//@version=6\nindicator(\"x\")\nplot(close)\n");
-        assert!(!crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "strategy-no-exit"));
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "strategy-no-exit")
+        );
     }
 
     #[test]
     fn strategy_with_import_not_flagged_no_exit() {
         // Exit could live in the imported library; suppressed by import guard.
-        let d = doc("//@version=6\nimport Foo/Bar/1 as lib\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\n");
-        assert!(!crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "strategy-no-exit"));
+        let d = doc(
+            "//@version=6\nimport Foo/Bar/1 as lib\nstrategy(\"S\")\nstrategy.entry(\"L\", strategy.long)\n",
+        );
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "strategy-no-exit")
+        );
     }
 
     // --- duplicate-parameter (Error) ---
@@ -647,26 +723,35 @@ mod tests {
     #[test]
     fn flags_duplicate_parameter() {
         let d = doc("//@version=6\nf(a, b, a) =>\n    a + b\nplot(f(1,2,3))\n");
-        assert!(crate::analyze(&d).iter().any(|diag| diag.code == "duplicate-parameter"
-            && diag.severity == Severity::Error
-            && diag.message.contains('a')));
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "duplicate-parameter"
+                    && diag.severity == Severity::Error
+                    && diag.message.contains('a'))
+        );
     }
 
     #[test]
     fn flags_duplicate_parameter_typed_defaulted_qualified() {
         // type/qualifier/default siblings must not hide the bare identifier name.
-        let d = doc("//@version=6\nf(int a, float b = 1.0, simple int a) =>\n    a + b\nplot(f(1))\n");
-        assert!(crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "duplicate-parameter" && diag.message.contains('a')));
+        let d =
+            doc("//@version=6\nf(int a, float b = 1.0, simple int a) =>\n    a + b\nplot(f(1))\n");
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "duplicate-parameter" && diag.message.contains('a'))
+        );
     }
 
     #[test]
     fn distinct_parameters_not_flagged() {
         let d = doc("//@version=6\nf(a, b, c) =>\n    a + b + c\nplot(f(1,2,3))\n");
-        assert!(!crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "duplicate-parameter"));
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "duplicate-parameter")
+        );
     }
 
     #[test]
@@ -674,9 +759,11 @@ mod tests {
         // Same param name across two separate definitions is valid; the HashSet
         // is per-function, so this must not false-positive.
         let d = doc("//@version=6\nf(a) =>\n    a\ng(a) =>\n    a\nplot(f(1)+g(2))\n");
-        assert!(!crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "duplicate-parameter"));
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "duplicate-parameter")
+        );
     }
 
     // --- redundant-na (Warning) ---
@@ -684,25 +771,31 @@ mod tests {
     #[test]
     fn flags_redundant_na() {
         let d = doc("//@version=6\nx = na(na(close))\nplot(x ? 1 : 0)\n");
-        assert!(crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "redundant-na" && diag.severity == Severity::Warning));
+        assert!(
+            crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "redundant-na" && diag.severity == Severity::Warning)
+        );
     }
 
     #[test]
     fn single_na_not_flagged() {
         let d = doc("//@version=6\nx = na(close)\nplot(x ? 1 : 0)\n");
-        assert!(!crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "redundant-na"));
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "redundant-na")
+        );
     }
 
     #[test]
     fn nz_wrapping_na_not_flagged() {
         // Outer fn is `nz`, not `na` — legitimate nesting, must not fire.
         let d = doc("//@version=6\nx = nz(na(close))\nplot(x ? 1 : 0)\n");
-        assert!(!crate::analyze(&d)
-            .iter()
-            .any(|diag| diag.code == "redundant-na"));
+        assert!(
+            !crate::analyze(&d)
+                .iter()
+                .any(|diag| diag.code == "redundant-na")
+        );
     }
 }

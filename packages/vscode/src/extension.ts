@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
@@ -32,18 +33,32 @@ export async function deactivate() {
 function createLanguageClient(
 	context: vscode.ExtensionContext,
 ): LanguageClient {
-	// Opt-in: when `pine.rustServerPath` points at the Rust `pine-lsp` binary,
-	// launch it over stdio instead of the bundled TypeScript server. Left empty
-	// the TS server (default) runs, so this never regresses existing users.
+	// Server selection precedence (highest first):
+	//   1. `pine.rustServerPath` setting — an explicit path to a Rust `pine-lsp`
+	//      binary, always wins when set.
+	//   2. A bundled Rust binary shipped in the VSIX at dist/bin/pine-lsp(.exe).
+	//   3. The bundled TypeScript LSP server (the original default, unchanged) —
+	//      guarantees no regression when no Rust binary is available.
 	const rustServerPath = vscode.workspace
 		.getConfiguration()
 		.get<string>("pine.rustServerPath", "")
 		.trim();
 
+	const bundledRustServer = context.asAbsolutePath(
+		path.join("dist", "bin", `pine-lsp${process.platform === "win32" ? ".exe" : ""}`),
+	);
+
 	let serverOptions: ServerOptions;
 	if (rustServerPath) {
+		console.log(`Pine LSP: using Rust server from pine.rustServerPath (${rustServerPath})`);
 		serverOptions = {
 			command: rustServerPath,
+			transport: TransportKind.stdio,
+		};
+	} else if (fs.existsSync(bundledRustServer)) {
+		console.log(`Pine LSP: using bundled Rust server (${bundledRustServer})`);
+		serverOptions = {
+			command: bundledRustServer,
 			transport: TransportKind.stdio,
 		};
 	} else {
@@ -51,6 +66,7 @@ function createLanguageClient(
 		const serverModule = context.asAbsolutePath(
 			path.join("dist", "packages", "lsp", "bin", "pine-lsp.js"),
 		);
+		console.log("Pine LSP: using bundled TypeScript server");
 		serverOptions = {
 			run: {
 				module: serverModule,

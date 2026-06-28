@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use pine_core::symbols::{self, SymbolKind};
-use pine_core::{builtins, Document};
+use pine_core::{Document, builtins};
 use tree_sitter::Node;
 
 mod logiclint;
@@ -193,25 +193,21 @@ fn check_type_annotations(doc: &Document, out: &mut Vec<Diagnostic>) {
 }
 
 fn walk_type_checks(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
-    if node.kind() == "variable_definition" {
-        if let (Some(ty), Some(init)) = (
+    if node.kind() == "variable_definition"
+        && let (Some(ty), Some(init)) = (
             node.child_by_field_name("type"),
             node.child_by_field_name("initial_value"),
-        ) {
-            if let (Some(declared), Some(inferred)) =
-                (base_type_name(ty, src), infer_type(init, src))
-            {
-                if is_type_mismatch(&declared, &inferred) {
-                    out.push(Diagnostic {
-                        start_byte: init.start_byte(),
-                        end_byte: init.end_byte(),
-                        severity: Severity::Error,
-                        code: "type-mismatch",
-                        message: format!("Cannot assign `{inferred}` to `{declared}`"),
-                    });
-                }
-            }
-        }
+        )
+        && let (Some(declared), Some(inferred)) = (base_type_name(ty, src), infer_type(init, src))
+        && is_type_mismatch(&declared, &inferred)
+    {
+        out.push(Diagnostic {
+            start_byte: init.start_byte(),
+            end_byte: init.end_byte(),
+            severity: Severity::Error,
+            code: "type-mismatch",
+            message: format!("Cannot assign `{inferred}` to `{declared}`"),
+        });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -433,22 +429,22 @@ fn check_constant_condition(doc: &Document, out: &mut Vec<Diagnostic>) {
 }
 
 fn walk_constant_condition(node: Node, out: &mut Vec<Diagnostic>) {
-    if matches!(node.kind(), "if_statement" | "conditional_expression") {
-        if let Some(cond) = node.child_by_field_name("condition") {
-            let message = match cond.kind() {
-                "true" => Some("Condition is always `true`, the branch is unconditional"),
-                "false" => Some("Condition is always `false`, the branch is dead code"),
-                _ => None,
-            };
-            if let Some(message) = message {
-                out.push(Diagnostic {
-                    start_byte: cond.start_byte(),
-                    end_byte: cond.end_byte(),
-                    severity: Severity::Warning,
-                    code: "constant-condition",
-                    message: message.to_string(),
-                });
-            }
+    if matches!(node.kind(), "if_statement" | "conditional_expression")
+        && let Some(cond) = node.child_by_field_name("condition")
+    {
+        let message = match cond.kind() {
+            "true" => Some("Condition is always `true`, the branch is unconditional"),
+            "false" => Some("Condition is always `false`, the branch is dead code"),
+            _ => None,
+        };
+        if let Some(message) = message {
+            out.push(Diagnostic {
+                start_byte: cond.start_byte(),
+                end_byte: cond.end_byte(),
+                severity: Severity::Warning,
+                code: "constant-condition",
+                message: message.to_string(),
+            });
         }
     }
     let mut cursor = node.walk();
@@ -498,9 +494,11 @@ mod tests {
     #[test]
     fn flags_unused_variable() {
         let d = doc("//@version=6\nunused = 42\nplot(close)\n");
-        assert!(analyze(&d)
-            .iter()
-            .any(|x| x.code == "unused-variable" && x.message.contains("unused")));
+        assert!(
+            analyze(&d)
+                .iter()
+                .any(|x| x.code == "unused-variable" && x.message.contains("unused"))
+        );
     }
 
     #[test]
@@ -518,17 +516,21 @@ mod tests {
     #[test]
     fn flags_undefined_identifier() {
         let d = doc("//@version=6\nindicator(\"x\")\nplot(undefinedXYZ)\n");
-        assert!(analyze(&d)
-            .iter()
-            .any(|x| x.code == "undeclared-identifier" && x.message.contains("undefinedXYZ")));
+        assert!(
+            analyze(&d)
+                .iter()
+                .any(|x| x.code == "undeclared-identifier" && x.message.contains("undefinedXYZ"))
+        );
     }
 
     #[test]
     fn flags_type_mismatch_string_to_int() {
         let d = doc("//@version=6\nint a = \"hello\"\nplot(a)\n");
-        assert!(analyze(&d)
-            .iter()
-            .any(|x| x.code == "type-mismatch" && x.message.contains("string")));
+        assert!(
+            analyze(&d)
+                .iter()
+                .any(|x| x.code == "type-mismatch" && x.message.contains("string"))
+        );
     }
 
     #[test]
@@ -547,9 +549,11 @@ mod tests {
     #[test]
     fn flags_unknown_named_argument() {
         let d = doc("//@version=6\nplot(close, notarealparam=1)\n");
-        assert!(analyze(&d)
-            .iter()
-            .any(|x| x.code == "unknown-argument" && x.message.contains("notarealparam")));
+        assert!(
+            analyze(&d)
+                .iter()
+                .any(|x| x.code == "unknown-argument" && x.message.contains("notarealparam"))
+        );
     }
 
     #[test]
@@ -581,8 +585,12 @@ mod tests {
     fn switch_assignment_target_not_flagged() {
         // `t = switch ...` binds t via variable_definition_statement.
         let d = doc("//@version=6\nt = switch\n    close > open => 1\n    => 0\nplot(t)\n");
-        assert!(!analyze(&d).iter().any(|x| x.code == "undeclared-identifier"),
-                "switch-assigned var should be a definition");
+        assert!(
+            !analyze(&d)
+                .iter()
+                .any(|x| x.code == "undeclared-identifier"),
+            "switch-assigned var should be a definition"
+        );
     }
 
     #[test]
@@ -593,30 +601,41 @@ mod tests {
             .filter(|x| x.code == "undeclared-identifier")
             .map(|x| x.message)
             .collect();
-        assert!(undeclared.is_empty(), "for-counter `i` should be defined: {undeclared:?}");
+        assert!(
+            undeclared.is_empty(),
+            "for-counter `i` should be defined: {undeclared:?}"
+        );
     }
 
     #[test]
     fn undefined_id_skipped_on_syntax_error() {
         // Broken parse → undefined-id suppressed (syntax error reported instead).
         let d = doc("//@version=6\nx = (1 +\n");
-        assert!(!analyze(&d).iter().any(|x| x.code == "undeclared-identifier"));
+        assert!(
+            !analyze(&d)
+                .iter()
+                .any(|x| x.code == "undeclared-identifier")
+        );
     }
 
     #[test]
     fn flags_constant_condition_if_true() {
         let d = doc("//@version=6\nindicator(\"x\")\nif true\n    plot(close)\n");
-        assert!(analyze(&d)
-            .iter()
-            .any(|x| x.code == "constant-condition" && x.message.contains("always `true`")));
+        assert!(
+            analyze(&d)
+                .iter()
+                .any(|x| x.code == "constant-condition" && x.message.contains("always `true`"))
+        );
     }
 
     #[test]
     fn flags_constant_condition_ternary_false() {
         let d = doc("//@version=6\nx = false ? 1 : 2\nplot(x)\n");
-        assert!(analyze(&d)
-            .iter()
-            .any(|x| x.code == "constant-condition" && x.message.contains("always `false`")));
+        assert!(
+            analyze(&d)
+                .iter()
+                .any(|x| x.code == "constant-condition" && x.message.contains("always `false`"))
+        );
     }
 
     #[test]
@@ -641,6 +660,9 @@ mod tests {
             .filter(|x| x.code == "undeclared-identifier")
             .map(|x| x.message)
             .collect();
-        assert!(fp.is_empty(), "unexpected undeclared-identifier diagnostics: {fp:?}");
+        assert!(
+            fp.is_empty(),
+            "unexpected undeclared-identifier diagnostics: {fp:?}"
+        );
     }
 }

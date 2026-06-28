@@ -79,6 +79,38 @@ const cliConfig = {
 	},
 };
 
+// Copy a locally-built Rust `pine-lsp` binary into dist/bin/ if one exists.
+// Wrapped so a missing binary (the common case in a TS-only build) only logs a
+// note and never fails the build.
+function copyBundledRustServer() {
+	try {
+		const isWindows = process.platform === "win32";
+		const binName = `pine-lsp${isWindows ? ".exe" : ""}`;
+		const releaseBin = path.join(
+			__dirname,
+			"..",
+			"pine-rs",
+			"target",
+			"release",
+			binName,
+		);
+		if (!fs.existsSync(releaseBin)) {
+			console.log(
+				`No Rust pine-lsp binary at ${releaseBin} (skipping bundle; TS server will be used)`,
+			);
+			return;
+		}
+		const binDir = path.join(outDir, "bin");
+		fs.mkdirSync(binDir, { recursive: true });
+		const dest = path.join(binDir, binName);
+		fs.copyFileSync(releaseBin, dest);
+		fs.chmodSync(dest, 0o755);
+		console.log(`Bundled Rust pine-lsp binary into ${dest}`);
+	} catch (error) {
+		console.log(`Skipping Rust binary bundle (non-fatal): ${error.message}`);
+	}
+}
+
 async function build() {
 	try {
 		if (watch) {
@@ -103,6 +135,15 @@ async function build() {
 
 			// Make CLI executable
 			fs.chmodSync("dist/packages/cli/src/cli.js", 0o755);
+
+			// Best-effort: bundle a locally-built Rust `pine-lsp` binary into
+			// dist/bin/ so the extension can prefer it (see extension.ts). This is
+			// a DEV convenience only — the marketplace per-platform packaging story
+			// lives in .github/workflows/rust-release.yml, which builds the correct
+			// binary for each target. Copying the host-arch debug/release binary
+			// here MUST NOT be used to ship a VSIX (it would be wrong-arch on other
+			// platforms). Absent binary => log a note and continue (never throws).
+			copyBundledRustServer();
 
 			console.log("Build complete!");
 		}

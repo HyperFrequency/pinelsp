@@ -1,8 +1,11 @@
 [package]
 name = "pine-check"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
 description = "Semantic analysis (type/lint checks) for Pine Script v6"
 
 [dependencies]
