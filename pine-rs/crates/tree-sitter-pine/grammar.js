@@ -302,8 +302,18 @@ module.exports = grammar({
 			$.attribute,
 			$.call,
 			$.identifier,
+			// Soft keywords (`type`, `series`, `simple`, `const`) are reserved only in
+			// their declaring constructs (type_definition_statement uses literal 'type';
+			// type_qualifier uses literal 'series'/'const'/'simple'). They are legal Pine
+			// v6 identifiers in expression position — e.g. a parameter named `type` used as
+			// the subject of `switch type`. Without this alternative the keyword
+			// interpretation wins in optional/expression contexts and the parse errors.
+			// Aliased to $.identifier so the AST node-kind stays uniform and every
+			// downstream consumer (checker, LSP, formatter) sees an ordinary identifier.
+			$._context_keyword_identifier,
 			$.parenthesized_expression,
 		),
+		_context_keyword_identifier: $ => alias(choice('type', 'series', 'simple', 'const'), $.identifier),
 		literals: $ => choice(
 			$.true,
 			$.false,

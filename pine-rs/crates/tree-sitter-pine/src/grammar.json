@@ -1504,9 +1504,39 @@
         },
         {
           "type": "SYMBOL",
+          "name": "_context_keyword_identifier"
+        },
+        {
+          "type": "SYMBOL",
           "name": "parenthesized_expression"
         }
       ]
+    },
+    "_context_keyword_identifier": {
+      "type": "ALIAS",
+      "content": {
+        "type": "CHOICE",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "type"
+          },
+          {
+            "type": "STRING",
+            "value": "series"
+          },
+          {
+            "type": "STRING",
+            "value": "simple"
+          },
+          {
+            "type": "STRING",
+            "value": "const"
+          }
+        ]
+      },
+      "named": true,
+      "value": "identifier"
     },
     "literals": {
       "type": "CHOICE",
