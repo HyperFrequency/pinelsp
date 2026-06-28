@@ -59,40 +59,17 @@ pub fn semantic_diagnostics(doc: &Document) -> Vec<Diagnostic> {
         .collect()
 }
 
-/// All diagnostics for a document: tree-sitter syntax errors + semantic checks
-/// + LSP-local import-resolution info.
+/// All diagnostics for a document: tree-sitter syntax errors + semantic checks.
+///
+/// Note: a missing `/// @source` directive is deliberately NOT diagnosed.
+/// `@source` is a local-library convenience; published imports (the common case,
+/// e.g. `import TradingView/ta/7`) have no local file and legitimately omit it,
+/// so flagging its absence would be a false-positive on valid v6. The hover over
+/// an import alias surfaces the missing-source note contextually instead.
 pub fn all_diagnostics(doc: &Document) -> Vec<Diagnostic> {
     let mut diags = syntax_diagnostics(doc);
     diags.extend(semantic_diagnostics(doc));
-    diags.extend(import_diagnostics(doc));
     diags
-}
-
-/// LSP-local INFO diagnostics for imports that lack a `/// @source` directive.
-///
-/// This lives here (not in `pine-check::analyze`) on purpose: it must NOT feed
-/// the oracle/CLI parity tests. A missing `@source` is explicitly NOT an error
-/// per the `imports` module contract — it only means cross-file IntelliSense is
-/// unavailable — so the severity is [`DiagnosticSeverity::INFORMATION`] and the
-/// diagnostic is emitted ONLY when `source.is_none()`, which makes it impossible
-/// to false-positive on a valid v6 script that simply omits the directive.
-pub fn import_diagnostics(doc: &Document) -> Vec<Diagnostic> {
-    import_table(doc)
-        .entries()
-        .iter()
-        .filter(|entry| entry.source.is_none())
-        .map(|entry| Diagnostic {
-            range: byte_range(doc, entry.start_byte, entry.end_byte),
-            severity: Some(DiagnosticSeverity::INFORMATION),
-            code: Some(NumberOrString::String("import-no-source".to_string())),
-            source: Some("pine-lsp".into()),
-            message: format!(
-                "import `{}` has no `/// @source` directive; cross-file IntelliSense unavailable",
-                entry.effective_namespace()
-            ),
-            ..Default::default()
-        })
-        .collect()
 }
 
 /// Collect ERROR/MISSING nodes, pruning subtrees that parsed cleanly.
@@ -137,13 +114,18 @@ fn import_alias_hover(doc: &Document, word: &str) -> Option<String> {
         .entries()
         .iter()
         .find(|entry| entry.effective_namespace() == word)?;
-    let mut markdown = format!(
-        "```pine\nimport {}/{}/{} as {}\n```",
-        entry.user,
-        entry.lib,
-        entry.version,
-        entry.effective_namespace()
-    );
+    // Render the `as` clause only when the import actually declared one — an
+    // aliasless `import User/Lib/1` must not fabricate `as Lib`.
+    let mut markdown = match &entry.alias {
+        Some(alias) => format!(
+            "```pine\nimport {}/{}/{} as {}\n```",
+            entry.user, entry.lib, entry.version, alias
+        ),
+        None => format!(
+            "```pine\nimport {}/{}/{}\n```",
+            entry.user, entry.lib, entry.version
+        ),
+    };
     match &entry.source {
         Some(path) => {
             markdown.push_str("\n\nSource: ");
@@ -986,6 +968,7 @@ mod tests {
         let h = hover_at(&d, pos_of(&d, src, "Strategy")).expect("hover on lib name");
         let md = hover_markdown(&h);
         assert!(md.contains("TV/Strategy/2"), "markdown: {md}");
+        assert!(!md.contains(" as "), "aliasless import must not fabricate `as`: {md}");
     }
 
     #[test]
@@ -1060,39 +1043,26 @@ mod tests {
     }
 
     #[test]
-    fn import_diagnostics_info_for_missing_source() {
-        let d = doc("//@version=6\nimport User/MyLib/1 as myLib\n");
-        let diags = import_diagnostics(&d);
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::INFORMATION));
-        assert_eq!(
-            diags[0].code,
-            Some(NumberOrString::String("import-no-source".to_string()))
+    fn source_less_import_emits_no_diagnostic() {
+        // `/// @source` is a local-library convenience; published imports
+        // legitimately omit it. A missing directive must NOT be flagged
+        // (regression guard against the removed `import-no-source` false-positive).
+        let d = doc("//@version=6\nindicator(\"x\")\nimport TradingView/ta/7\nplot(close)\n");
+        let diags = all_diagnostics(&d);
+        assert!(
+            !diags.iter().any(|d| d.code
+                == Some(NumberOrString::String("import-no-source".to_string()))),
+            "source-less import must not produce a diagnostic"
         );
-        // Range covers the import line (row 1).
-        assert_eq!(diags[0].range.start.line, 1);
-        assert_eq!(diags[0].range.end.line, 1);
     }
 
     #[test]
-    fn import_diagnostics_none_when_source_present() {
-        let d = doc("//@version=6\n/// @source ./libs/a.pine\nimport User/MyLib/1 as myLib\n");
-        assert!(import_diagnostics(&d).is_empty());
-    }
-
-    #[test]
-    fn all_diagnostics_merges_import_info_without_dropping_others() {
-        // Missing @source (INFO) AND a syntax error (ERROR) must both surface.
+    fn all_diagnostics_keeps_syntax_errors_with_imports() {
         let d = doc("//@version=6\nimport User/MyLib/1 as myLib\nx = (1 + \n");
         let diags = all_diagnostics(&d);
         assert!(
             diags.iter().any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
             "syntax ERROR must remain"
-        );
-        assert!(
-            diags.iter().any(|d| d.code
-                == Some(NumberOrString::String("import-no-source".to_string()))),
-            "import-no-source INFO must be merged"
         );
     }
 
@@ -1100,7 +1070,6 @@ mod tests {
     fn no_import_no_diagnostics_no_completion_change() {
         // A plain indicator/plot doc with zero imports: additive-only proof.
         let d = doc("//@version=6\nindicator(\"x\")\nplot(close)\n");
-        assert!(import_diagnostics(&d).is_empty());
         let items = completions_at(&d, Position::new(3, 0));
         assert!(
             !items.iter().any(|i| i.kind == Some(CompletionItemKind::MODULE)),
