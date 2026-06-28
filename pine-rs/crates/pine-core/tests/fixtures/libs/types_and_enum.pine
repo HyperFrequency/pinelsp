@@ -1,0 +1,18 @@
+//@version=6
+// Exported type + enum, plus a non-exported type/enum that must be excluded.
+
+export type Point
+    float x
+    float y
+
+export enum Color
+    red
+    green
+    blue
+
+type Internal
+    int n
+
+enum Hidden
+    a
+    b

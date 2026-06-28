@@ -1,0 +1,5 @@
+//@version=6
+// An exported method with qualified parameter types.
+
+export method scale(series float x, simple int n) =>
+    x * n

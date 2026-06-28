@@ -30,6 +30,7 @@
 //!   `source` (a false-negative, which is the acceptable bias here).
 
 use crate::Document;
+use std::path::Path;
 use tree_sitter::Node;
 
 /// A single parsed `import` statement.
@@ -250,6 +251,333 @@ fn parse_source_directive(comment_text: &str) -> Option<String> {
     Some(path.to_string())
 }
 
+// ===========================================================================
+// Bounded library-source resolver (additive, descriptive-only).
+//
+// Given an already-parsed [`ImportTable`] and a base directory, this resolves
+// each entry whose `/// @source` directive names a LOCAL relative path by
+// reading + parsing the referenced lib file and extracting its top-level
+// EXPORTED declarations. Published imports (no `@source`) resolve to
+// [`ImportResolution::Unresolved`], which is explicitly **not** an error.
+//
+// This emits NO diagnostics and changes no existing parsing, so it cannot
+// create a v6 false positive. Callers decide what (if anything) to surface.
+//
+// ## Grammar facts this relies on (verified against the live CST)
+//
+// - `export` is an **anonymous** token (`{type:"export", named:false}`) and is
+//   NOT a field. It appears as the FIRST direct child of
+//   `function_declaration_statement`, `type_definition_statement`, and
+//   `enum_declaration` (each `optional('export')`). `to_sexp()` hides it, but
+//   `node.children()` yields it — so export is detected by scanning direct
+//   children for `kind() == "export"` (never `child_by_field_name`, which
+//   always returns `None` for an anonymous token).
+// - Function name is field `function`; methods use field `method` (mirroring
+//   `symbols.rs::collect_defs`).
+// - Parameters live in an ordered field sequence: an optional `qualifier`
+//   (`type_qualifier`, e.g. `series`/`simple`), then an optional `type`
+//   (`base_type`/`array_type`/`generic_type`), then the required `argument`
+//   (`identifier`), then an optional `default_value`. Because `type` is a
+//   SEPARATE, possibly-shorter field list than `argument`
+//   (`myFn(int a, c)` -> 2 args, 1 type), params CANNOT be zipped by index.
+//   Extraction is an ORDERED single cursor walk tracking `field_name()`:
+//   stash a seen `type` as the pending type, and on each `argument` emit a
+//   param consuming the pending type; a following `default_value` marks the
+//   just-emitted param as defaulted.
+// ===========================================================================
+
+/// What kind of top-level exported declaration a symbol is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportKind {
+    Function,
+    Method,
+    Type,
+    Enum,
+}
+
+/// One parameter of an exported function/method.
+///
+/// `type_name` is best-effort: the source text of the param's `type` field if
+/// present, otherwise `None` (a typeless param like `c` in `f(int a, c)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedParam {
+    pub name: String,
+    pub type_name: Option<String>,
+    pub has_default: bool,
+}
+
+/// A single top-level exported declaration from a lib file.
+///
+/// `params` is empty for [`ExportKind::Type`] and [`ExportKind::Enum`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedSymbol {
+    pub name: String,
+    pub kind: ExportKind,
+    pub params: Vec<ExportedParam>,
+}
+
+/// The outcome of resolving one import entry's `/// @source` directive.
+#[derive(Debug, Clone)]
+pub enum ImportResolution {
+    /// A local lib file was read + parsed; these exports were recovered. This
+    /// can be returned even if the lib had parse ERROR nodes (tree-sitter still
+    /// yields a tree; we collect best-effort).
+    Resolved(Vec<ExportedSymbol>),
+    /// No `/// @source` directive (the common published-import case). NOT an
+    /// error — the resolver has nothing local to read.
+    Unresolved,
+    /// A `@source` was given but the file could not be read, the path was
+    /// absolute, or it escaped the base directory (refused for safety).
+    NotFound,
+    /// The file was read but `Document::parse` returned `None`. Does not happen
+    /// in practice (tree-sitter recovers); kept for completeness.
+    ParseFailed,
+}
+
+/// One import entry paired with its [`ImportResolution`].
+#[derive(Debug, Clone)]
+pub struct ResolvedImport<'a> {
+    pub entry: &'a ImportEntry,
+    pub resolution: ImportResolution,
+}
+
+/// All resolved imports for a document, in the table's source order.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedImports<'a> {
+    entries: Vec<ResolvedImport<'a>>,
+}
+
+impl<'a> ResolvedImports<'a> {
+    /// All resolved-import records, in source order.
+    pub fn entries(&self) -> &[ResolvedImport<'a>] {
+        &self.entries
+    }
+
+    /// True when there were no imports to resolve.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Number of resolved-import records.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Look up a resolved import by the underlying entry's **explicit** alias
+    /// (mirrors [`ImportTable::by_alias`] — aliasless imports are not matched).
+    pub fn by_alias(&self, alias: &str) -> Option<&ResolvedImport<'a>> {
+        self.entries
+            .iter()
+            .find(|resolved| resolved.entry.alias.as_deref() == Some(alias))
+    }
+}
+
+/// Resolve every entry of `table` against `base_dir`.
+///
+/// See [`ImportResolution`] for the per-entry outcomes and the module-level
+/// docs for the safety contract. This reads files but emits no diagnostics.
+pub fn resolve_imports<'a>(table: &'a ImportTable, base_dir: &Path) -> ResolvedImports<'a> {
+    let entries = table
+        .entries()
+        .iter()
+        .map(|entry| ResolvedImport {
+            entry,
+            resolution: resolve_entry(entry, base_dir),
+        })
+        .collect();
+    ResolvedImports { entries }
+}
+
+/// Resolve one entry. Published imports (no `@source`) are `Unresolved`; local
+/// `@source` paths are read + parsed under the [path-safety](safe_local_path)
+/// contract.
+fn resolve_entry(entry: &ImportEntry, base_dir: &Path) -> ImportResolution {
+    let Some(rel) = entry.source.as_deref() else {
+        return ImportResolution::Unresolved;
+    };
+
+    let Some(target) = safe_local_path(base_dir, rel) else {
+        return ImportResolution::NotFound;
+    };
+
+    let Ok(contents) = std::fs::read_to_string(&target) else {
+        return ImportResolution::NotFound;
+    };
+
+    match Document::parse(contents) {
+        Some(doc) => ImportResolution::Resolved(exported_symbols(&doc)),
+        None => ImportResolution::ParseFailed,
+    }
+}
+
+/// Resolve a relative `@source` path under `base_dir`, refusing anything that
+/// escapes the base directory.
+///
+/// Deliberate safety choices (an LSP must not be coaxed into reading arbitrary
+/// files by a directive in a script):
+/// - Absolute `source` paths are rejected (the contract is a LOCAL relative
+///   path).
+/// - The joined path is canonicalized and required to stay under the
+///   canonical `base_dir`, so `../../etc/passwd` is refused.
+///
+/// Returns `None` (-> `NotFound`) for any rejected or non-existent path.
+fn safe_local_path(base_dir: &Path, rel: &str) -> Option<std::path::PathBuf> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return None;
+    }
+
+    // Canonicalize the base first; if the base itself can't be canonicalized
+    // (doesn't exist) we cannot safely contain anything, so refuse.
+    let canonical_base = base_dir.canonicalize().ok()?;
+
+    // Canonicalize the joined target. canonicalize() requires the path to
+    // exist, which doubles as the "file is missing -> NotFound" check and
+    // resolves any `..` segments so the prefix check below is sound.
+    let canonical_target = canonical_base.join(rel_path).canonicalize().ok()?;
+
+    if canonical_target.starts_with(&canonical_base) {
+        Some(canonical_target)
+    } else {
+        None
+    }
+}
+
+/// Extract every top-level **exported** declaration from a parsed lib document.
+///
+/// Reusable and fs-free (testable directly). Returns an empty vec for a lib
+/// with no exports — that is not an error. Best-effort on ERROR-recovery trees:
+/// missing fields are simply skipped, never unwrapped.
+pub fn exported_symbols(doc: &Document) -> Vec<ExportedSymbol> {
+    let src = doc.text();
+    let mut out = Vec::new();
+    collect_exports(doc.root(), src, &mut out);
+    out
+}
+
+fn collect_exports(node: Node, src: &str, out: &mut Vec<ExportedSymbol>) {
+    match node.kind() {
+        "function_declaration_statement" if has_export_child(node) => {
+            if let Some(symbol) = parse_exported_function(node, src) {
+                out.push(symbol);
+            }
+        }
+        "type_definition_statement" if has_export_child(node) => {
+            if let Some(name) = field_identifier_text(node, "name", src) {
+                out.push(ExportedSymbol {
+                    name,
+                    kind: ExportKind::Type,
+                    params: Vec::new(),
+                });
+            }
+        }
+        "enum_declaration" if has_export_child(node) => {
+            if let Some(name) = field_identifier_text(node, "name", src) {
+                out.push(ExportedSymbol {
+                    name,
+                    kind: ExportKind::Enum,
+                    params: Vec::new(),
+                });
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_exports(child, src, out);
+    }
+}
+
+/// True iff a direct child is the anonymous `export` token. `export` has no
+/// field, so this is the only reliable way to detect it.
+fn has_export_child(node: Node) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| child.kind() == "export")
+}
+
+/// Text of the `identifier`-kinded child under `field`, if present.
+fn field_identifier_text(node: Node, field: &str, src: &str) -> Option<String> {
+    let id = node.child_by_field_name(field)?;
+    if id.kind() != "identifier" {
+        return None;
+    }
+    Some(src[id.start_byte()..id.end_byte()].to_string())
+}
+
+/// Build an [`ExportedSymbol`] for an exported function or method declaration.
+fn parse_exported_function(node: Node, src: &str) -> Option<ExportedSymbol> {
+    // Regular functions bind the `function` field; methods bind `method`
+    // (mirroring symbols.rs::collect_defs). The presence of `method` decides
+    // the kind.
+    let is_method = node.child_by_field_name("method").is_some();
+    let name = field_identifier_text(node, "function", src)
+        .or_else(|| field_identifier_text(node, "method", src))?;
+
+    let kind = if is_method {
+        ExportKind::Method
+    } else {
+        ExportKind::Function
+    };
+
+    Some(ExportedSymbol {
+        name,
+        kind,
+        params: collect_params(node, src),
+    })
+}
+
+/// Collect a declaration's parameters via an ORDERED cursor walk over its
+/// direct children, tracking `field_name()`.
+///
+/// The grammar emits, per param and in this order: optional `qualifier`,
+/// optional `type`, required `argument`, optional `default_value`. Because the
+/// `type` list can be shorter than the `argument` list, we MUST associate a
+/// `type` with the next `argument` positionally as we walk — never by zipping
+/// the two field lists by index.
+fn collect_params(node: Node, src: &str) -> Vec<ExportedParam> {
+    let mut params = Vec::new();
+    let mut pending_type: Option<String> = None;
+
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return params;
+    }
+    loop {
+        let child = cursor.node();
+        match cursor.field_name() {
+            Some("type") => {
+                // Stash the type for the NEXT `argument`. Take the whole `type`
+                // node's text (base_type / array_type / generic_type).
+                pending_type = Some(src[child.start_byte()..child.end_byte()].to_string());
+            }
+            Some("argument") if child.kind() == "identifier" => {
+                params.push(ExportedParam {
+                    name: src[child.start_byte()..child.end_byte()].to_string(),
+                    type_name: pending_type.take(),
+                    has_default: false,
+                });
+            }
+            Some("default_value") => {
+                // Marks the parameter we just emitted as having a default.
+                if let Some(last) = params.last_mut() {
+                    last.has_default = true;
+                }
+            }
+            // `qualifier` and any anonymous tokens (`(`, `,`, `)`) are ignored.
+            // A stray `qualifier` does not disturb the pending type because we
+            // only clear `pending_type` when an `argument` consumes it.
+            _ => {}
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    params
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +741,111 @@ mod tests {
         let t = table(src);
         assert_eq!(t.len(), 1);
         assert_eq!(t.entries()[0].source, None);
+    }
+
+    // --- exported_symbols: fs-free extraction tests ------------------------
+
+    fn exports(src: &str) -> Vec<ExportedSymbol> {
+        let doc = Document::parse(src).expect("parse");
+        exported_symbols(&doc)
+    }
+
+    #[test]
+    fn exported_function_with_typed_and_defaulted_params() {
+        let src = "//@version=6\nexport f(int a, float b = 1.0) =>\n    a + b\n";
+        let syms = exports(src);
+        assert_eq!(syms.len(), 1);
+        let f = &syms[0];
+        assert_eq!(f.name, "f");
+        assert_eq!(f.kind, ExportKind::Function);
+        assert_eq!(
+            f.params,
+            vec![
+                ExportedParam {
+                    name: "a".to_string(),
+                    type_name: Some("int".to_string()),
+                    has_default: false,
+                },
+                ExportedParam {
+                    name: "b".to_string(),
+                    type_name: Some("float".to_string()),
+                    has_default: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn non_exported_function_is_not_collected() {
+        let src = "//@version=6\ng(c) =>\n    c * 2\n";
+        let syms = exports(src);
+        assert!(
+            syms.is_empty(),
+            "a function without the `export` token must not be collected"
+        );
+    }
+
+    #[test]
+    fn exported_method_with_qualified_types() {
+        let src = "//@version=6\nexport method scale(series float x, simple int n) =>\n    x * n\n";
+        let syms = exports(src);
+        assert_eq!(syms.len(), 1);
+        let m = &syms[0];
+        assert_eq!(m.name, "scale");
+        assert_eq!(m.kind, ExportKind::Method);
+        // Qualifier (`series`/`simple`) must not break type/name extraction.
+        assert_eq!(m.params.len(), 2);
+        assert_eq!(m.params[0].name, "x");
+        assert_eq!(m.params[0].type_name.as_deref(), Some("float"));
+        assert_eq!(m.params[1].name, "n");
+        assert_eq!(m.params[1].type_name.as_deref(), Some("int"));
+    }
+
+    #[test]
+    fn typeless_param_is_not_index_zipped_to_wrong_type() {
+        // `f(int a, c)`: 2 args, 1 type. Index-zipping would give `c` the type
+        // `int`; the ordered walk must instead leave `c` typeless.
+        let src = "//@version=6\nexport f(int a, c) =>\n    a\n";
+        let syms = exports(src);
+        assert_eq!(syms.len(), 1);
+        let params = &syms[0].params;
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "a");
+        assert_eq!(params[0].type_name.as_deref(), Some("int"));
+        assert_eq!(params[1].name, "c");
+        assert_eq!(
+            params[1].type_name, None,
+            "typeless param must not inherit a sibling's type via index-zip"
+        );
+    }
+
+    #[test]
+    fn exported_type_and_enum_collected_with_empty_params() {
+        let src = "//@version=6\nexport type Point\n    float x\n    float y\nexport enum Color\n    red\n    green\n";
+        let syms = exports(src);
+        assert_eq!(syms.len(), 2);
+        let point = syms.iter().find(|s| s.name == "Point").expect("Point");
+        assert_eq!(point.kind, ExportKind::Type);
+        assert!(point.params.is_empty());
+        let color = syms.iter().find(|s| s.name == "Color").expect("Color");
+        assert_eq!(color.kind, ExportKind::Enum);
+        assert!(color.params.is_empty());
+    }
+
+    #[test]
+    fn non_exported_type_and_enum_excluded() {
+        let src = "//@version=6\ntype Internal\n    int n\nenum Hidden\n    a\n    b\n";
+        let syms = exports(src);
+        assert!(
+            syms.is_empty(),
+            "type/enum without `export` must be excluded"
+        );
+    }
+
+    #[test]
+    fn zero_export_library_returns_empty_vec() {
+        let src = "//@version=6\nindicator(\"x\")\nf(a) =>\n    a\nplot(close)\n";
+        let syms = exports(src);
+        assert!(syms.is_empty(), "no exports is not an error");
     }
 }

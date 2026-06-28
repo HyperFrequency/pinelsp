@@ -1,0 +1,9 @@
+//@version=6
+// A lib that parses with ERROR nodes (the dangling line below) but still has a
+// recoverable exported function above it. The resolver must collect `ok` and
+// not panic on the malformed tail.
+
+export ok(int a) =>
+    a
+
+this is not valid pine @@@ &&&
