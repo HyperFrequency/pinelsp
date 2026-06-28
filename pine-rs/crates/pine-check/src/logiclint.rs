@@ -5,6 +5,7 @@
 
 use crate::{dotted, Diagnostic, Severity};
 use pine_core::Document;
+use std::collections::HashSet;
 use tree_sitter::Node;
 
 pub(crate) fn check(doc: &Document, out: &mut Vec<Diagnostic>) {
@@ -14,9 +15,13 @@ pub(crate) fn check(doc: &Document, out: &mut Vec<Diagnostic>) {
 
 fn walk(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
     match node.kind() {
-        "call" => check_request_security_lookahead(node, src, out),
+        "call" => {
+            check_request_security_lookahead(node, src, out);
+            check_redundant_na(node, src, out);
+        }
         "subscript" => check_negative_history(node, src, out),
         "reassignment" => check_self_assignment(node, src, out),
+        "function_declaration_statement" => check_duplicate_params(node, src, out),
         "if_statement" | "for_statement" | "for_in_statement" | "while_statement" => {
             check_ta_stateful_in_conditional(node, src, out)
         }
@@ -168,6 +173,84 @@ fn check_self_assignment(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
         severity: Severity::Warning,
         code: "self-assignment",
         message: format!("Self-assignment `{name} := {name}` has no effect"),
+    });
+}
+
+/// Two parameters with the same name in a single function/method definition is
+/// a genuine Pine error (TradingView rejects it), so this is Error severity.
+/// The grammar surfaces each parameter as one `argument:` field that is always a
+/// bare `(identifier)` — even with type annotations, qualifiers, and defaults
+/// (those are separate sibling fields), so reading only `children_by_field_name
+/// ("argument")` extracts the name unambiguously. The `HashSet` is local to this
+/// call, so the same name reused in two *different* function definitions never
+/// false-positives (each `function_declaration_statement` visit owns its own
+/// set). Each duplicate is reported once, at the redeclaring occurrence (not the
+/// first). Works for both `function:` and `method:` declarations since both use
+/// the same `argument:` fields. Robust under parse errors: a malformed function
+/// simply yields no/fewer `argument` fields and emits nothing.
+fn check_duplicate_params(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
+    let mut cursor = node.walk();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for arg in node.children_by_field_name("argument", &mut cursor) {
+        // The `argument` field is always a bare identifier; guard anyway so a
+        // future grammar change can't cause a misnamed report.
+        if arg.kind() != "identifier" {
+            continue;
+        }
+        let name = node_text(arg, src);
+        if !seen.insert(name) {
+            out.push(Diagnostic {
+                start_byte: arg.start_byte(),
+                end_byte: arg.end_byte(),
+                severity: Severity::Error,
+                code: "duplicate-parameter",
+                message: format!("Duplicate parameter `{name}` in function definition"),
+            });
+        }
+    }
+}
+
+/// `na(na(x))` is redundant: `na()` already returns a bool, so wrapping it in
+/// another `na()` is a pure no-op. TradingView accepts it (not a compile error),
+/// so this is a Warning. `na` is a reserved builtin and cannot be shadowed by a
+/// user function, so matching on the name `na` is unambiguous. False-positive
+/// discipline: fires only when the OUTER call's function is exactly `na` AND the
+/// FIRST POSITIONAL (named) child of the argument list is itself a `call` whose
+/// function is exactly `na`. `nz(na(close))` does not match (outer is `nz`); a
+/// keyword-argument first child (e.g. a hypothetical `na(x=...)`) is skipped
+/// because only a bare positional `call` qualifies. The diagnostic spans the
+/// outer call so the fix (drop one `na`) is clear.
+fn check_redundant_na(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
+    let Some(func) = node.child_by_field_name("function") else {
+        return;
+    };
+    if dotted(func, src).as_deref() != Some("na") {
+        return;
+    }
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    let Some(first) = args.named_children(&mut cursor).next() else {
+        return;
+    };
+    // Must be a bare positional inner `call` named `na`. A keyword_argument or
+    // any non-call first child does not qualify.
+    if first.kind() != "call" {
+        return;
+    }
+    let Some(inner_func) = first.child_by_field_name("function") else {
+        return;
+    };
+    if dotted(inner_func, src).as_deref() != Some("na") {
+        return;
+    }
+    out.push(Diagnostic {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        severity: Severity::Warning,
+        code: "redundant-na",
+        message: "`na(na(x))` is redundant; the inner `na()` already returns a bool".to_string(),
     });
 }
 
@@ -557,5 +640,69 @@ mod tests {
         assert!(!crate::analyze(&d)
             .iter()
             .any(|diag| diag.code == "strategy-no-exit"));
+    }
+
+    // --- duplicate-parameter (Error) ---
+
+    #[test]
+    fn flags_duplicate_parameter() {
+        let d = doc("//@version=6\nf(a, b, a) =>\n    a + b\nplot(f(1,2,3))\n");
+        assert!(crate::analyze(&d).iter().any(|diag| diag.code == "duplicate-parameter"
+            && diag.severity == Severity::Error
+            && diag.message.contains('a')));
+    }
+
+    #[test]
+    fn flags_duplicate_parameter_typed_defaulted_qualified() {
+        // type/qualifier/default siblings must not hide the bare identifier name.
+        let d = doc("//@version=6\nf(int a, float b = 1.0, simple int a) =>\n    a + b\nplot(f(1))\n");
+        assert!(crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "duplicate-parameter" && diag.message.contains('a')));
+    }
+
+    #[test]
+    fn distinct_parameters_not_flagged() {
+        let d = doc("//@version=6\nf(a, b, c) =>\n    a + b + c\nplot(f(1,2,3))\n");
+        assert!(!crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "duplicate-parameter"));
+    }
+
+    #[test]
+    fn same_name_in_two_functions_not_flagged() {
+        // Same param name across two separate definitions is valid; the HashSet
+        // is per-function, so this must not false-positive.
+        let d = doc("//@version=6\nf(a) =>\n    a\ng(a) =>\n    a\nplot(f(1)+g(2))\n");
+        assert!(!crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "duplicate-parameter"));
+    }
+
+    // --- redundant-na (Warning) ---
+
+    #[test]
+    fn flags_redundant_na() {
+        let d = doc("//@version=6\nx = na(na(close))\nplot(x ? 1 : 0)\n");
+        assert!(crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "redundant-na" && diag.severity == Severity::Warning));
+    }
+
+    #[test]
+    fn single_na_not_flagged() {
+        let d = doc("//@version=6\nx = na(close)\nplot(x ? 1 : 0)\n");
+        assert!(!crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "redundant-na"));
+    }
+
+    #[test]
+    fn nz_wrapping_na_not_flagged() {
+        // Outer fn is `nz`, not `na` — legitimate nesting, must not fire.
+        let d = doc("//@version=6\nx = nz(na(close))\nplot(x ? 1 : 0)\n");
+        assert!(!crate::analyze(&d)
+            .iter()
+            .any(|diag| diag.code == "redundant-na"));
     }
 }
