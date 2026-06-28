@@ -80,6 +80,38 @@ next:
 		return false;
 	}
 
+	// Leading-operator line continuation: if the next line begins with a
+	// continuation operator, suppress the INDENT/DEDENT/NEWLINE break so the
+	// expression stays open across the physical line break. In Pine v6 a line
+	// can only legitimately START with `?`/`:` (ternary arms — switch arms use
+	// `=>`) or `.` (attribute/method chains), so treating a leading one of
+	// these as a continuation is unambiguous.
+	//
+	// `?`/`:` are handled with pure lookahead (no advance). For `.` we need one
+	// char past the dot to distinguish an attribute access (`.method`) from a
+	// float literal (`.5`); we only treat it as a continuation when a letter or
+	// underscore follows. We mark_end before skipping the dot so that, if the
+	// dot is NOT followed by a letter/underscore, the lexer's reported end stays
+	// at the dot and the consumed character does not corrupt the token stream.
+	if (found_end_of_line && !lexer->eof(lexer)) {
+		int32_t c = lexer->lookahead;
+		if (c == '?' || c == ':') {
+			return false;
+		}
+		if (c == '.') {
+			lexer->mark_end(lexer);
+			skip(lexer);
+			int32_t after_dot = lexer->lookahead;
+			if (after_dot == '_' || (after_dot >= 'a' && after_dot <= 'z') ||
+			    (after_dot >= 'A' && after_dot <= 'Z')) {
+				return false;
+			}
+			// Not an attribute access (e.g. `.5`): fall through to emit the
+			// break. mark_end above keeps the reported token boundary at the
+			// dot, so the consumed `.` is not lost.
+		}
+	}
+
 	if (found_end_of_line) {
 		if (scanner->indents.size > 0) {
 			uint16_t current_indent_length = *array_back(&scanner->indents);
