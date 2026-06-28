@@ -135,7 +135,8 @@ fn collect_refs(node: Node, src: &str, name: &str, out: &mut Vec<(usize, usize)>
     if node.kind() == "identifier" && &src[node.start_byte()..node.end_byte()] == name {
         let is_member = node.parent().is_some_and(|p| {
             p.kind() == "attribute"
-                && p.child_by_field_name("attribute").is_some_and(|a| a == node)
+                && p.child_by_field_name("attribute")
+                    .is_some_and(|a| a == node)
         });
         if !is_member {
             out.push((node.start_byte(), node.end_byte()));
@@ -165,8 +166,14 @@ mod tests {
         assert!(names.contains(&"f"));
         assert!(names.contains(&"a")); // parameter
         assert!(names.contains(&"z"));
-        assert!(defs.iter().any(|d| d.name == "f" && d.kind == SymbolKind::Function));
-        assert!(defs.iter().any(|d| d.name == "a" && d.kind == SymbolKind::Parameter));
+        assert!(
+            defs.iter()
+                .any(|d| d.name == "f" && d.kind == SymbolKind::Function)
+        );
+        assert!(
+            defs.iter()
+                .any(|d| d.name == "a" && d.kind == SymbolKind::Parameter)
+        );
     }
 
     #[test]

@@ -6,10 +6,8 @@
 
 use std::path::PathBuf;
 
-use pine_core::imports::{
-    import_table, resolve_imports, ExportKind, ImportResolution,
-};
 use pine_core::Document;
+use pine_core::imports::{ExportKind, ImportResolution, import_table, resolve_imports};
 
 /// The committed fixture-lib directory used as the resolver's `base_dir`.
 fn libs_dir() -> PathBuf {
@@ -50,7 +48,10 @@ fn local_source_resolves_to_expected_exported_symbols() {
     };
 
     // The resolved path is the canonical absolute lib file.
-    assert!(path.is_absolute(), "resolved path must be absolute: {path:?}");
+    assert!(
+        path.is_absolute(),
+        "resolved path must be absolute: {path:?}"
+    );
     assert!(
         path.ends_with("math_utils.pine"),
         "resolved path must point at the lib file: {path:?}"
@@ -84,7 +85,10 @@ fn local_source_resolves_method_and_types() {
     let resolved = resolve_imports(&table, &libs_dir());
 
     let wm = resolved.by_alias("wm").expect("wm");
-    let ImportResolution::Resolved { symbols: wm_syms, .. } = &wm.resolution else {
+    let ImportResolution::Resolved {
+        symbols: wm_syms, ..
+    } = &wm.resolution
+    else {
         panic!("expected Resolved for wm, got {:?}", wm.resolution);
     };
     assert_eq!(wm_syms.len(), 1);
@@ -92,7 +96,10 @@ fn local_source_resolves_method_and_types() {
     assert_eq!(wm_syms[0].kind, ExportKind::Method);
 
     let te = resolved.by_alias("te").expect("te");
-    let ImportResolution::Resolved { symbols: te_syms, .. } = &te.resolution else {
+    let ImportResolution::Resolved {
+        symbols: te_syms, ..
+    } = &te.resolution
+    else {
         panic!("expected Resolved for te, got {:?}", te.resolution);
     };
     // Exported Point (Type) + Color (Enum); Internal/Hidden excluded.
@@ -134,8 +141,7 @@ fn path_traversal_outside_base_dir_is_refused() {
 
 #[test]
 fn absolute_source_path_is_refused() {
-    let src =
-        "//@version=6\n/// @source /etc/hosts\nimport User/Abs/1 as a\n";
+    let src = "//@version=6\n/// @source /etc/hosts\nimport User/Abs/1 as a\n";
     let table = table(src);
     let resolved = resolve_imports(&table, &libs_dir());
 

@@ -10,8 +10,8 @@
 
 use std::io::{BufRead, Write};
 
-use pine_core::{builtins, Document};
-use serde_json::{json, Value};
+use pine_core::{Document, builtins};
+use serde_json::{Value, json};
 
 fn main() {
     let stdin = std::io::stdin();
@@ -92,11 +92,15 @@ fn handle_call(params: Option<&Value>) -> Value {
         "pine_validate" => validate(&arg_str("code")),
         "pine_lookup" => lookup(&arg_str("name")),
         "pine_list_functions" => {
-            let ns = args.and_then(|a| a.get("namespace")).and_then(Value::as_str);
+            let ns = args
+                .and_then(|a| a.get("namespace"))
+                .and_then(Value::as_str);
             list_functions(ns)
         }
         "pine_format" => format_code(&arg_str("code")),
-        other => return json!({ "content": [text_block(format!("unknown tool: {other}"))], "isError": true }),
+        other => {
+            return json!({ "content": [text_block(format!("unknown tool: {other}"))], "isError": true });
+        }
     };
     json!({ "content": [text_block(text)] })
 }
@@ -117,7 +121,14 @@ fn validate(code: &str) -> String {
         .iter()
         .map(|d| {
             let (line, col) = doc.position_at(d.start_byte);
-            format!("{}:{}: {:?}: {} [{}]", line + 1, col + 1, d.severity, d.message, d.code)
+            format!(
+                "{}:{}: {:?}: {} [{}]",
+                line + 1,
+                col + 1,
+                d.severity,
+                d.message,
+                d.code
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -125,7 +136,11 @@ fn validate(code: &str) -> String {
 
 fn lookup(name: &str) -> String {
     if let Some(f) = builtins::function(name) {
-        let head = if f.syntax.is_empty() { &f.name } else { &f.syntax };
+        let head = if f.syntax.is_empty() {
+            &f.name
+        } else {
+            &f.syntax
+        };
         return format!("{head}\n\n{}\n\nreturns: {}", f.description, f.returns);
     }
     if let Some(v) = builtins::variable(name) {

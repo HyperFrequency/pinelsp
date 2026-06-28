@@ -5,8 +5,8 @@
 //! than each crate depending on `pine-data-codegen` directly.
 
 pub use pine_data_codegen::{
-    constant, function, is_keyword, variable, BuiltinConstant, BuiltinFunction, BuiltinVariable,
-    FunctionFlags, Keywords, Param, CONSTANTS, FUNCTIONS, KEYWORDS, VARIABLES,
+    BuiltinConstant, BuiltinFunction, BuiltinVariable, CONSTANTS, FUNCTIONS, FunctionFlags,
+    KEYWORDS, Keywords, Param, VARIABLES, constant, function, is_keyword, variable,
 };
 
 #[cfg(test)]

@@ -166,11 +166,11 @@ fn builtin_doc(word: &str) -> Option<String> {
     }
     if let Some(c) = builtins::constant(word) {
         let mut s = format!("```pine\n{}: {}\n```", c.name, c.ty);
-        if let Some(d) = &c.description {
-            if !d.is_empty() {
-                s.push_str("\n\n");
-                s.push_str(d);
-            }
+        if let Some(d) = &c.description
+            && !d.is_empty()
+        {
+            s.push_str("\n\n");
+            s.push_str(d);
         }
         return Some(s);
     }
@@ -631,16 +631,15 @@ pub fn goto_definition(
     // the identifier text regardless of whether it is a member; the same-file
     // definition lookup simply finds nothing for a cross-file member, so we fall
     // through to the import path below.
-    if let Some((name, _, _)) = symbols::identifier_at(doc, byte) {
-        if let Some(def) = symbols::definitions(doc)
+    if let Some((name, _, _)) = symbols::identifier_at(doc, byte)
+        && let Some(def) = symbols::definitions(doc)
             .into_iter()
             .find(|d| d.name == name)
-        {
-            return Some(GotoDefinitionResponse::Scalar(Location {
-                uri,
-                range: byte_range(doc, def.start_byte, def.end_byte),
-            }));
-        }
+    {
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri,
+            range: byte_range(doc, def.start_byte, def.end_byte),
+        }));
     }
 
     // Cross-file fallback: cursor on the member of `alias.member`.

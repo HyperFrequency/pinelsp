@@ -36,11 +36,7 @@ impl LineIndex {
             return self.len;
         }
         let line_start = self.line_starts[line];
-        let line_end = self
-            .line_starts
-            .get(line + 1)
-            .copied()
-            .unwrap_or(self.len);
+        let line_end = self.line_starts.get(line + 1).copied().unwrap_or(self.len);
         let mut utf16 = 0u32;
         for (byte_off, ch) in text[line_start..line_end].char_indices() {
             if utf16 >= character_utf16 {
@@ -124,6 +120,9 @@ mod tests {
         let text = "abc\n";
         let idx = LineIndex::new(text);
         assert_eq!(idx.offset_at(text, 99, 0), text.len());
-        assert_eq!(idx.position_at(text, 9999), idx.position_at(text, text.len()));
+        assert_eq!(
+            idx.position_at(text, 9999),
+            idx.position_at(text, text.len())
+        );
     }
 }

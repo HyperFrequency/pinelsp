@@ -82,12 +82,38 @@ jobs:
             pine-lsp-${{ matrix.target }}.tar.gz
             pine-lsp-${{ matrix.target }}.zip
 
+  # Gate: the `secrets` context is NOT available in a job-level `if`, so a
+  # publish job cannot self-skip on `secrets.X != ''`. Instead we read the
+  # secrets here via step `env` (where they ARE available), expose their
+  # presence as job outputs, and have each publish job gate on
+  # `needs.gate.outputs.*` (the `needs` context IS available in a job-level `if`).
+  gate:
+    name: check publish secrets
+    runs-on: ubuntu-latest
+    outputs:
+      has_cargo: ${{ steps.check.outputs.has_cargo }}
+      has_npm: ${{ steps.check.outputs.has_npm }}
+      has_pypi: ${{ steps.check.outputs.has_pypi }}
+    steps:
+      - id: check
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          {
+            echo "has_cargo=$([ -n "$CARGO_REGISTRY_TOKEN" ] && echo true || echo false)"
+            echo "has_npm=$([ -n "$NPM_TOKEN" ] && echo true || echo false)"
+            echo "has_pypi=$([ -n "$PYPI_TOKEN" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+
   # STUB / author-only: publishes crates to crates.io in dependency order.
   # No-ops entirely when CARGO_REGISTRY_TOKEN is unset.
   crates-io:
     name: publish crates.io (stub)
     runs-on: ubuntu-latest
-    if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    needs: gate
+    if: needs.gate.outputs.has_cargo == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -113,7 +139,8 @@ jobs:
   wasm-npm:
     name: build + publish wasm/npm (stub)
     runs-on: ubuntu-latest
-    if: ${{ secrets.NPM_TOKEN != '' }}
+    needs: gate
+    if: needs.gate.outputs.has_npm == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -137,7 +164,8 @@ jobs:
   pypi:
     name: build + publish wheels (stub)
     runs-on: ubuntu-latest
-    if: ${{ secrets.PYPI_TOKEN != '' }}
+    needs: gate
+    if: needs.gate.outputs.has_pypi == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

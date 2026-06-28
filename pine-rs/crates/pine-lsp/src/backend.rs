@@ -24,12 +24,14 @@ use crate::features;
 /// `(effective_namespace, ImportResolution)` pairs — `ImportResolution` is
 /// `Clone` and owns its data (canonical `path: PathBuf`, `symbols: Vec<...>`).
 ///
-/// `key` is a sorted vector of each `/// @source` lib's path + mtime. A stale
-/// lib edit changes its mtime -> key mismatch -> re-resolve; a lib file
-/// appearing/disappearing flips its sentinel (`None` mtime) entry, also
-/// invalidating.
+/// `key` is a sorted vector of `(effective_namespace, lib path, mtime)` for each
+/// `/// @source` import. A stale lib edit changes its mtime, an alias rename
+/// (`as A` -> `as B`) changes the namespace, and a lib file appearing/
+/// disappearing flips its `None` mtime sentinel — any of which mismatches the
+/// key and forces a re-resolve, so a renamed alias never serves the old
+/// namespace's members.
 struct CachedImports {
-    key: Vec<(PathBuf, Option<SystemTime>)>,
+    key: Vec<(String, PathBuf, Option<SystemTime>)>,
     resolved: Vec<(String, ImportResolution)>,
 }
 
@@ -80,27 +82,32 @@ impl Backend {
 }
 
 /// Build the cache key for `doc`'s imports under `base_dir`: a sorted vector of
-/// each `/// @source` lib's joined path + mtime. Missing/unreadable libs get a
-/// `None` mtime sentinel so a lib appearing/disappearing changes the key.
+/// `(effective_namespace, joined lib path, mtime)` for each `/// @source`
+/// import. Missing/unreadable libs get a `None` mtime sentinel so a lib
+/// appearing/disappearing changes the key; including the effective namespace
+/// means an alias rename (`as A` -> `as B`) also invalidates, so a renamed alias
+/// never serves the old namespace's members.
 ///
 /// Paths are joined lexically (NOT canonicalized) — keying only needs to track
 /// the same files' existence + mtime; `resolve_imports` owns the path-safety
-/// contract.
+/// contract. Published imports (no `@source`) contribute nothing: they resolve
+/// to no cross-file members regardless of alias, so they cannot go stale.
 fn import_cache_key(
     doc: &Document,
     base_dir: &std::path::Path,
-) -> Vec<(PathBuf, Option<SystemTime>)> {
+) -> Vec<(String, PathBuf, Option<SystemTime>)> {
     let table = import_table(doc);
-    let mut key: Vec<(PathBuf, Option<SystemTime>)> = table
+    let mut key: Vec<(String, PathBuf, Option<SystemTime>)> = table
         .entries()
         .iter()
-        .filter_map(|entry| entry.source.as_deref())
-        .map(|source| {
-            let path = base_dir.join(source);
-            let mtime = std::fs::metadata(&path)
-                .and_then(|meta| meta.modified())
-                .ok();
-            (path, mtime)
+        .filter_map(|entry| {
+            entry.source.as_deref().map(|source| {
+                let path = base_dir.join(source);
+                let mtime = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok();
+                (entry.effective_namespace().to_string(), path, mtime)
+            })
         })
         .collect();
     key.sort();
@@ -613,7 +620,11 @@ mod tests {
         // key mismatch by planting a cache entry whose mtime sentinel differs
         // (deterministic — avoids depending on coarse filesystem mtime ticks).
         dir.write("lib.pine", "//@version=6\nexport two() =>\n    2\n");
-        let stale_key = vec![(dir.path.join("lib.pine"), Some(SystemTime::UNIX_EPOCH))];
+        let stale_key = vec![(
+            "L".to_string(),
+            dir.path.join("lib.pine"),
+            Some(SystemTime::UNIX_EPOCH),
+        )];
         cache.insert(
             uri.clone(),
             CachedImports {
@@ -631,6 +642,40 @@ mod tests {
     }
 
     #[test]
+    fn cache_invalidates_when_import_alias_renamed() {
+        // Renaming an alias (`as A` -> `as B`) WITHOUT touching the lib file must
+        // not keep serving the old namespace's members. Regression guard: a key
+        // of only (path, mtime) missed this; the key now includes the effective
+        // namespace, so the rename forces a re-resolve.
+        let dir = TempLibDir::new("rename");
+        dir.write("lib.pine", "//@version=6\nexport one() =>\n    1\n");
+        let uri = fake_uri();
+        let mut cache: HashMap<Url, CachedImports> = HashMap::new();
+
+        let doc_a = Document::parse(
+            "//@version=6\n/// @source ./lib.pine\nimport User/Lib/1 as A\n".to_string(),
+        )
+        .expect("doc parses");
+        let first = resolve_imports_cached(&mut cache, &uri, &doc_a, &dir.path);
+        assert_eq!(member_names(&first, "A"), vec!["one".to_string()]);
+
+        let doc_b = Document::parse(
+            "//@version=6\n/// @source ./lib.pine\nimport User/Lib/1 as B\n".to_string(),
+        )
+        .expect("doc parses");
+        let second = resolve_imports_cached(&mut cache, &uri, &doc_b, &dir.path);
+        assert!(
+            member_names(&second, "A").is_empty(),
+            "after `as A` -> `as B` the old alias `A` must no longer resolve"
+        );
+        assert_eq!(
+            member_names(&second, "B"),
+            vec!["one".to_string()],
+            "the new alias `B` must resolve to the lib's exports"
+        );
+    }
+
+    #[test]
     fn cache_key_changes_when_source_file_created_or_deleted() {
         let dir = TempLibDir::new("sentinel");
         let doc = doc_importing("./lib.pine");
@@ -639,7 +684,7 @@ mod tests {
         let key_absent = import_cache_key(&doc, &dir.path);
         assert_eq!(key_absent.len(), 1);
         assert!(
-            key_absent[0].1.is_none(),
+            key_absent[0].2.is_none(),
             "missing @source lib must key on a None mtime sentinel"
         );
 
@@ -647,7 +692,7 @@ mod tests {
         dir.write("lib.pine", "//@version=6\nexport one() =>\n    1\n");
         let key_present = import_cache_key(&doc, &dir.path);
         assert!(
-            key_present[0].1.is_some(),
+            key_present[0].2.is_some(),
             "present @source lib must key on a real mtime"
         );
         assert_ne!(

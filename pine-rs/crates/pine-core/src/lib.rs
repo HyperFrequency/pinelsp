@@ -213,6 +213,10 @@ mod tests {
         }
 
         eprintln!("fixture corpus: {error_free}/{total} parsed error-free");
-        assert!(total > 0, "expected at least one .pine fixture in {}", dir.display());
+        assert!(
+            total > 0,
+            "expected at least one .pine fixture in {}",
+            dir.display()
+        );
     }
 }

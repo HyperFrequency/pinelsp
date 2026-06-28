@@ -148,7 +148,10 @@ fn walk_imports(node: Node, src: &str, out: &mut Vec<ImportEntry>) {
     // node has no nested imports, but we recurse unconditionally below anyway
     // (cheap, and robust to ERROR-recovery shapes).
     let is_named_import = node.kind() == "import" && node.is_named();
-    if let Some(entry) = is_named_import.then(|| parse_import_node(node, src)).flatten() {
+    if let Some(entry) = is_named_import
+        .then(|| parse_import_node(node, src))
+        .flatten()
+    {
         out.push(entry);
     }
 
@@ -705,7 +708,10 @@ mod tests {
         // `import User/Lib` (no version) yields an ERROR node and no import node.
         let src = "//@version=6\nimport User/Lib\n";
         let t = table(src);
-        assert!(t.is_empty(), "must not fabricate an entry from an ERROR node");
+        assert!(
+            t.is_empty(),
+            "must not fabricate an entry from an ERROR node"
+        );
     }
 
     #[test]
@@ -907,7 +913,10 @@ mod tests {
         assert_eq!(syms.len(), 1);
         let scale = &syms[0];
         assert_eq!(scale.kind, ExportKind::Method);
-        assert_eq!(&lib_src[scale.name_byte_start..scale.name_byte_end], "scale");
+        assert_eq!(
+            &lib_src[scale.name_byte_start..scale.name_byte_end],
+            "scale"
+        );
     }
 
     #[test]
@@ -916,9 +925,15 @@ mod tests {
         let syms = exports(lib_src);
         let point = syms.iter().find(|s| s.name == "Point").expect("Point");
         assert_eq!(point.kind, ExportKind::Type);
-        assert_eq!(&lib_src[point.name_byte_start..point.name_byte_end], "Point");
+        assert_eq!(
+            &lib_src[point.name_byte_start..point.name_byte_end],
+            "Point"
+        );
         let color = syms.iter().find(|s| s.name == "Color").expect("Color");
         assert_eq!(color.kind, ExportKind::Enum);
-        assert_eq!(&lib_src[color.name_byte_start..color.name_byte_end], "Color");
+        assert_eq!(
+            &lib_src[color.name_byte_start..color.name_byte_end],
+            "Color"
+        );
     }
 }

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser as ClapParser;
-use pine_check::{analyze, Severity};
+use pine_check::{Severity, analyze};
 use pine_core::Document;
 use serde::Serialize;
 
@@ -72,7 +72,9 @@ fn main() -> ExitCode {
     };
 
     let diagnostics = analyze(&doc);
-    let has_error = diagnostics.iter().any(|d| matches!(d.severity, Severity::Error));
+    let has_error = diagnostics
+        .iter()
+        .any(|d| matches!(d.severity, Severity::Error));
 
     if args.json {
         let out = Report {
@@ -87,8 +89,14 @@ fn main() -> ExitCode {
                         code: d.code,
                         message: d.message.clone(),
                         range: RangeOut {
-                            start: PosOut { line: sl, character: sc },
-                            end: PosOut { line: el, character: ec },
+                            start: PosOut {
+                                line: sl,
+                                character: sc,
+                            },
+                            end: PosOut {
+                                line: el,
+                                character: ec,
+                            },
                         },
                     }
                 })

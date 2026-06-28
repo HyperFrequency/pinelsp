@@ -163,9 +163,21 @@ mod tests {
 
     #[test]
     fn name_indexes_are_complete() {
-        assert_eq!(FUNCTIONS_BY_NAME.len(), FUNCTIONS.len(), "no duplicate fn names");
-        assert_eq!(VARIABLES_BY_NAME.len(), VARIABLES.len(), "no duplicate var names");
-        assert_eq!(CONSTANTS_BY_NAME.len(), CONSTANTS.len(), "no duplicate const names");
+        assert_eq!(
+            FUNCTIONS_BY_NAME.len(),
+            FUNCTIONS.len(),
+            "no duplicate fn names"
+        );
+        assert_eq!(
+            VARIABLES_BY_NAME.len(),
+            VARIABLES.len(),
+            "no duplicate var names"
+        );
+        assert_eq!(
+            CONSTANTS_BY_NAME.len(),
+            CONSTANTS.len(),
+            "no duplicate const names"
+        );
     }
 
     #[test]
@@ -185,7 +197,10 @@ mod tests {
 
     #[test]
     fn builtin_variable_close_present() {
-        assert!(variable("close").is_some(), "close should be a builtin variable");
+        assert!(
+            variable("close").is_some(),
+            "close should be a builtin variable"
+        );
     }
 
     #[test]
