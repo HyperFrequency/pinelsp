@@ -549,6 +549,10 @@
         "required": false,
         "types": [
           {
+            "type": "integer",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           }
@@ -1341,7 +1345,7 @@
       "required": true,
       "types": [
         {
-          "type": "base_type",
+          "type": "type",
           "named": true
         }
       ]
@@ -1834,6 +1838,11 @@
   {
     "type": "as",
     "named": false
+  },
+  {
+    "type": "block_comment",
+    "named": true,
+    "extra": true
   },
   {
     "type": "break",

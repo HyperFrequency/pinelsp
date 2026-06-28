@@ -16,6 +16,7 @@ module.exports = grammar({
 
 	extras: $ => [
 		$.comment,
+		$.block_comment,
 		/[\s\f\uFEFF\u2060\u200B]|\r?\n/,
 		$.line_continuation,
 	],
@@ -186,7 +187,7 @@ module.exports = grammar({
 			$._indent,
 			repeat1(seq(
 				field('field', $.identifier),
-				optional(seq('=', field('title', $.string))),
+				optional(seq('=', field('title', choice($.string, $.integer)))),
 				$._newline
 			)),
 			$._dedent
@@ -416,7 +417,7 @@ module.exports = grammar({
 		),
 		template_argument_list: $ => seq(
 			'<',
-			sep1($.base_type, ','),
+			sep1($.type, ','),
 			'>'
 		),
 		type_qualifier: _ => choice(
@@ -488,6 +489,7 @@ module.exports = grammar({
 			)),
 			$._newline
 		),
+		block_comment: _ => token(seq('/*', /[^*]*\*+([^/*][^*]*\*+)*/, '/')),
 		annotations: _ => token(prec(1, seq(
 			'@', 
 			choice(

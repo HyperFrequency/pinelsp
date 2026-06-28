@@ -691,8 +691,17 @@
                         "type": "FIELD",
                         "name": "title",
                         "content": {
-                          "type": "SYMBOL",
-                          "name": "string"
+                          "type": "CHOICE",
+                          "members": [
+                            {
+                              "type": "SYMBOL",
+                              "name": "string"
+                            },
+                            {
+                              "type": "SYMBOL",
+                              "name": "integer"
+                            }
+                          ]
                         }
                       }
                     ]
@@ -2280,7 +2289,7 @@
           "members": [
             {
               "type": "SYMBOL",
-              "name": "base_type"
+              "name": "type"
             },
             {
               "type": "REPEAT",
@@ -2293,7 +2302,7 @@
                   },
                   {
                     "type": "SYMBOL",
-                    "name": "base_type"
+                    "name": "type"
                   }
                 ]
               }
@@ -2740,6 +2749,26 @@
         }
       ]
     },
+    "block_comment": {
+      "type": "TOKEN",
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "/*"
+          },
+          {
+            "type": "PATTERN",
+            "value": "[^*]*\\*+([^/*][^*]*\\*+)*"
+          },
+          {
+            "type": "STRING",
+            "value": "/"
+          }
+        ]
+      }
+    },
     "annotations": {
       "type": "TOKEN",
       "content": {
@@ -2844,6 +2873,10 @@
     {
       "type": "SYMBOL",
       "name": "comment"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "block_comment"
     },
     {
       "type": "PATTERN",
