@@ -5,12 +5,12 @@
 
 use std::collections::HashMap;
 
+use pine_core::Document;
 use pine_core::builtins;
 use pine_core::imports::{
-    import_table, resolve_imports, ExportKind, ExportedSymbol, ImportEntry, ImportResolution,
+    ExportKind, ExportedSymbol, ImportEntry, ImportResolution, import_table, resolve_imports,
 };
 use pine_core::symbols::{self, SymbolKind as DefKind};
-use pine_core::Document;
 use tower_lsp::lsp_types::*;
 use tree_sitter::Node;
 
@@ -144,7 +144,11 @@ fn import_alias_hover(doc: &Document, word: &str) -> Option<String> {
 
 fn builtin_doc(word: &str) -> Option<String> {
     if let Some(f) = builtins::function(word) {
-        let head = if f.syntax.is_empty() { &f.name } else { &f.syntax };
+        let head = if f.syntax.is_empty() {
+            &f.name
+        } else {
+            &f.syntax
+        };
         let mut s = format!("```pine\n{head}\n```");
         if !f.description.is_empty() {
             s.push_str("\n\n");
@@ -182,6 +186,10 @@ fn builtin_doc(word: &str) -> Option<String> {
 /// doc, or any non-`file:` URL) reproduces the builtin-only behavior exactly:
 /// no filesystem access and no cross-file members. Cross-file resolution fires
 /// strictly on the post-`.` branch, so top-level completion stays fs-free.
+// Uncached fallback retained as the documented public API and exercised by the
+// unit tests (the running server uses `completions_at_cached`). In a bin-only
+// build with no test cfg nothing calls it, so silence dead_code there.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn completions_at(
     doc: &Document,
     pos: Position,
@@ -207,11 +215,35 @@ pub fn completions_at(
     }
 }
 
+/// Cached-path twin of [`completions_at`]: identical behavior, but cross-file
+/// member completion uses the backend's pre-resolved import projection
+/// (`resolved`) instead of re-reading/re-parsing libs per keystroke. The
+/// top-level (no-`.`) and builtin-namespace branches are unchanged.
+pub fn completions_at_cached(
+    doc: &Document,
+    pos: Position,
+    resolved: &[(String, ImportResolution)],
+) -> Vec<CompletionItem> {
+    let byte = doc.offset_at(pos.line, pos.character);
+    let run = trailing_run(doc.text(), byte);
+    match run.rfind('.') {
+        Some(dot) => {
+            let namespace = &run[..dot];
+            let mut items = namespace_members(namespace);
+            append_imported_members_cached(namespace, resolved, &mut items);
+            items
+        }
+        None => top_level_items(doc),
+    }
+}
+
 /// Resolve `namespace`'s imported library (if any) and append its exported
 /// symbols to `items`. No-op unless an import entry's effective namespace
 /// matches `namespace` AND its `/// @source` resolved successfully. Uses
 /// `effective_namespace` (not `by_alias`) so aliasless imports — whose
 /// namespace falls back to the lib name — also resolve.
+// Only reached via the uncached `completions_at` fallback (tests). See note there.
+#[cfg_attr(not(test), allow(dead_code))]
 fn append_imported_members(
     doc: &Document,
     namespace: &str,
@@ -247,10 +279,32 @@ fn append_imported_members(
     }
 }
 
+/// Cached-path twin of [`append_imported_members`]: given a pre-resolved
+/// `(effective_namespace, ImportResolution)` projection (built + cached in the
+/// backend so we don't re-read/re-parse libs per keystroke), append the matching
+/// namespace's exported members. Pure in-memory work — no filesystem access.
+///
+/// Semantics intentionally mirror the uncached path: only `Resolved` entries
+/// contribute members; `Unresolved`/`NotFound`/`ParseFailed` append nothing.
+pub(crate) fn append_imported_members_cached(
+    namespace: &str,
+    resolved: &[(String, ImportResolution)],
+    items: &mut Vec<CompletionItem>,
+) {
+    let Some((_, resolution)) = resolved.iter().find(|(ns, _)| ns == namespace) else {
+        return;
+    };
+    if let ImportResolution::Resolved { symbols, .. } = resolution {
+        for symbol in symbols {
+            items.push(exported_item(symbol));
+        }
+    }
+}
+
 /// Map an [`ExportedSymbol`] to a bare-member [`CompletionItem`] (label is the
 /// symbol name with no namespace prefix, consistent with builtin
 /// `namespace_members`).
-fn exported_item(symbol: &ExportedSymbol) -> CompletionItem {
+pub(crate) fn exported_item(symbol: &ExportedSymbol) -> CompletionItem {
     let kind = match symbol.kind {
         ExportKind::Function | ExportKind::Method => CompletionItemKind::FUNCTION,
         ExportKind::Type => CompletionItemKind::STRUCT,
@@ -316,13 +370,25 @@ fn namespace_members(ns: &str) -> Vec<CompletionItem> {
 fn top_level_items(doc: &Document) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     for f in builtins::FUNCTIONS.iter() {
-        items.push(item(f.name.clone(), CompletionItemKind::FUNCTION, fn_detail(f)));
+        items.push(item(
+            f.name.clone(),
+            CompletionItemKind::FUNCTION,
+            fn_detail(f),
+        ));
     }
     for v in builtins::VARIABLES.iter() {
-        items.push(item(v.name.clone(), CompletionItemKind::VARIABLE, v.ty.clone()));
+        items.push(item(
+            v.name.clone(),
+            CompletionItemKind::VARIABLE,
+            v.ty.clone(),
+        ));
     }
     for c in builtins::CONSTANTS.iter() {
-        items.push(item(c.name.clone(), CompletionItemKind::CONSTANT, c.ty.clone()));
+        items.push(item(
+            c.name.clone(),
+            CompletionItemKind::CONSTANT,
+            c.ty.clone(),
+        ));
     }
     for k in builtins::KEYWORDS.all.iter() {
         items.push(CompletionItem {
@@ -362,9 +428,15 @@ fn import_completion(entry: &ImportEntry) -> CompletionItem {
 /// `ta`/`math` with import-alias completion items.
 fn is_builtin_namespace_head(name: &str) -> bool {
     let prefix = format!("{name}.");
-    builtins::FUNCTIONS.iter().any(|f| f.name.starts_with(&prefix))
-        || builtins::VARIABLES.iter().any(|v| v.name.starts_with(&prefix))
-        || builtins::CONSTANTS.iter().any(|c| c.name.starts_with(&prefix))
+    builtins::FUNCTIONS
+        .iter()
+        .any(|f| f.name.starts_with(&prefix))
+        || builtins::VARIABLES
+            .iter()
+            .any(|v| v.name.starts_with(&prefix))
+        || builtins::CONSTANTS
+            .iter()
+            .any(|c| c.name.starts_with(&prefix))
 }
 
 fn item(label: String, kind: CompletionItemKind, detail: String) -> CompletionItem {
@@ -446,8 +518,8 @@ pub fn signature_help(doc: &Document, pos: Position) -> Option<SignatureHelp> {
                 .then(|| Documentation::String(p.description.clone())),
         })
         .collect();
-    let active_parameter = (!parameters.is_empty())
-        .then(|| (active as u32).min(parameters.len() as u32 - 1));
+    let active_parameter =
+        (!parameters.is_empty()).then(|| (active as u32).min(parameters.len() as u32 - 1));
     Some(SignatureHelp {
         signatures: vec![SignatureInformation {
             label,
@@ -543,6 +615,10 @@ fn to_symbol_kind(kind: DefKind) -> SymbolKind {
 /// used only to resolve local `/// @source` paths under the existing
 /// path-safety contract. `None` (in-memory/`untitled:` docs) disables the
 /// cross-file fallback entirely — behavior is then identical to same-file goto.
+// Uncached fallback retained as the documented public API and exercised by the
+// unit tests (the running server uses `goto_definition_cached`). Silenced in
+// the bin-only build where no test cfg calls it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn goto_definition(
     doc: &Document,
     pos: Position,
@@ -556,7 +632,10 @@ pub fn goto_definition(
     // definition lookup simply finds nothing for a cross-file member, so we fall
     // through to the import path below.
     if let Some((name, _, _)) = symbols::identifier_at(doc, byte) {
-        if let Some(def) = symbols::definitions(doc).into_iter().find(|d| d.name == name) {
+        if let Some(def) = symbols::definitions(doc)
+            .into_iter()
+            .find(|d| d.name == name)
+        {
             return Some(GotoDefinitionResponse::Scalar(Location {
                 uri,
                 range: byte_range(doc, def.start_byte, def.end_byte),
@@ -568,12 +647,39 @@ pub fn goto_definition(
     goto_imported_member(doc, byte, base_dir)
 }
 
+/// Cached-path twin of [`goto_definition`]: same-file resolution is identical;
+/// the cross-file member fallback uses the backend's pre-resolved import
+/// projection (`resolved`) instead of calling `resolve_imports` per request.
+pub fn goto_definition_cached(
+    doc: &Document,
+    pos: Position,
+    uri: Url,
+    resolved: &[(String, ImportResolution)],
+) -> Option<GotoDefinitionResponse> {
+    let byte = doc.offset_at(pos.line, pos.character);
+
+    if let Some((name, _, _)) = symbols::identifier_at(doc, byte)
+        && let Some(def) = symbols::definitions(doc)
+            .into_iter()
+            .find(|d| d.name == name)
+    {
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri,
+            range: byte_range(doc, def.start_byte, def.end_byte),
+        }));
+    }
+
+    goto_imported_member_cached(doc, byte, resolved)
+}
+
 /// Resolve go-to-definition into an imported `/// @source` library when the
 /// cursor sits on the MEMBER side of an `alias.member` access. Returns `None`
 /// (graceful degrade, never panics) for any of: `base_dir` absent, cursor not on
 /// an attribute member, the object is not an imported namespace, the import is
 /// Unresolved/NotFound/ParseFailed, the member is not exported, the lib re-read
 /// fails, or the path cannot be turned into a file URL.
+// Only reached via the uncached `goto_definition` fallback (tests). See note there.
+#[cfg_attr(not(test), allow(dead_code))]
 fn goto_imported_member(
     doc: &Document,
     byte: usize,
@@ -621,6 +727,53 @@ fn goto_imported_member(
     // the lib's own LineIndex (re-parse it) to convert them — using the main
     // doc's index would give wrong rows. Re-read from the canonical `path`
     // (never a raw @source string), preserving the path-safety contract.
+    let lib_contents = std::fs::read_to_string(path).ok()?;
+    let lib_doc = Document::parse(lib_contents)?;
+    let (start_line, start_col) = lib_doc.position_at(symbol.name_byte_start);
+    let (end_line, end_col) = lib_doc.position_at(symbol.name_byte_end);
+    let lib_uri = Url::from_file_path(path).ok()?;
+
+    Some(GotoDefinitionResponse::Scalar(Location {
+        uri: lib_uri,
+        range: Range {
+            start: Position::new(start_line, start_col),
+            end: Position::new(end_line, end_col),
+        },
+    }))
+}
+
+/// Cached-path twin of [`goto_imported_member`]: resolves the member of an
+/// `alias.member` access using a pre-resolved `(effective_namespace,
+/// ImportResolution)` projection (cached in the backend) instead of calling
+/// `resolve_imports` here. The single unavoidable filesystem read is the lib
+/// re-read needed to map the symbol's lib-coordinate byte offsets to a line/col
+/// range (the cached `ImportResolution::Resolved.path` is the canonical,
+/// path-safety-checked target, so re-reading it preserves the safety contract).
+/// Returns `None` for the same graceful-degrade cases as the uncached path.
+pub(crate) fn goto_imported_member_cached(
+    doc: &Document,
+    byte: usize,
+    resolved: &[(String, ImportResolution)],
+) -> Option<GotoDefinitionResponse> {
+    let leaf = doc.root().named_descendant_for_byte_range(byte, byte)?;
+    let attribute = enclosing_attribute(leaf)?;
+    let object_node = attribute.child_by_field_name("object")?;
+    let member_node = attribute.child_by_field_name("attribute")?;
+    if member_node != leaf {
+        return None;
+    }
+    let src = doc.text();
+    let object = &src[object_node.start_byte()..object_node.end_byte()];
+    let member = &src[member_node.start_byte()..member_node.end_byte()];
+
+    let (_, resolution) = resolved.iter().find(|(ns, _)| ns == object)?;
+    let ImportResolution::Resolved { path, symbols } = resolution else {
+        return None;
+    };
+    let symbol = symbols.iter().find(|symbol| symbol.name == member)?;
+
+    // Byte offsets are in the LIB's coordinate space, so convert them with the
+    // lib's own LineIndex (re-parse it) — see goto_imported_member.
     let lib_contents = std::fs::read_to_string(path).ok()?;
     let lib_doc = Document::parse(lib_contents)?;
     let (start_line, start_col) = lib_doc.position_at(symbol.name_byte_start);
@@ -846,7 +999,11 @@ pub fn semantic_tokens(doc: &Document) -> SemanticTokens {
     let (mut prev_line, mut prev_char) = (0u32, 0u32);
     for (line, character, length, token_type, token_modifiers_bitset) in raw {
         let delta_line = line - prev_line;
-        let delta_start = if delta_line == 0 { character - prev_char } else { character };
+        let delta_start = if delta_line == 0 {
+            character - prev_char
+        } else {
+            character
+        };
         data.push(SemanticToken {
             delta_line,
             delta_start,
@@ -857,7 +1014,10 @@ pub fn semantic_tokens(doc: &Document) -> SemanticTokens {
         prev_line = line;
         prev_char = character;
     }
-    SemanticTokens { result_id: None, data }
+    SemanticTokens {
+        result_id: None,
+        data,
+    }
 }
 
 fn user_kind_map(doc: &Document) -> std::collections::HashMap<String, DefKind> {
@@ -1034,7 +1194,10 @@ mod tests {
         // cursor right after "ta." → line 1, char 7
         let items = completions_at(&d, Position::new(1, 7), None);
         assert!(items.iter().any(|i| i.label == "sma"), "expected ta.sma");
-        assert!(items.iter().all(|i| !i.label.contains('.')), "members are bare");
+        assert!(
+            items.iter().all(|i| !i.label.contains('.')),
+            "members are bare"
+        );
     }
 
     #[test]
@@ -1053,7 +1216,11 @@ mod tests {
         let sh = signature_help(&d, Position::new(1, 18)).expect("sig help for ta.sma");
         assert_eq!(sh.signatures.len(), 1);
         assert!(!sh.signatures[0].label.is_empty());
-        assert_eq!(sh.active_parameter, Some(1), "after one comma → param index 1");
+        assert_eq!(
+            sh.active_parameter,
+            Some(1),
+            "after one comma → param index 1"
+        );
     }
 
     #[test]
@@ -1062,7 +1229,10 @@ mod tests {
         let names: Vec<String> = document_symbols(&d).into_iter().map(|s| s.name).collect();
         assert!(names.iter().any(|n| n == "len"));
         assert!(names.iter().any(|n| n == "f"));
-        assert!(!names.iter().any(|n| n == "a"), "params excluded from doc symbols");
+        assert!(
+            !names.iter().any(|n| n == "a"),
+            "params excluded from doc symbols"
+        );
     }
 
     #[test]
@@ -1085,7 +1255,10 @@ mod tests {
     #[test]
     fn no_rename_on_builtin() {
         let d = doc("//@version=6\nplot(close)\n");
-        assert!(prepare_rename(&d, Position::new(1, 5)).is_none(), "close is builtin");
+        assert!(
+            prepare_rename(&d, Position::new(1, 5)).is_none(),
+            "close is builtin"
+        );
     }
 
     #[test]
@@ -1132,7 +1305,11 @@ mod tests {
         assert!(types.contains(&T_NAMESPACE), "ta → namespace");
         assert!(types.contains(&T_COMMENT), "//@version → comment");
         // close is a builtin variable → defaultLibrary modifier present somewhere
-        assert!(toks.data.iter().any(|t| t.token_modifiers_bitset & M_DEFAULT_LIBRARY != 0));
+        assert!(
+            toks.data
+                .iter()
+                .any(|t| t.token_modifiers_bitset & M_DEFAULT_LIBRARY != 0)
+        );
     }
 
     #[test]
@@ -1182,7 +1359,10 @@ mod tests {
         let h = hover_at(&d, pos_of(&d, src, "Strategy")).expect("hover on lib name");
         let md = hover_markdown(&h);
         assert!(md.contains("TV/Strategy/2"), "markdown: {md}");
-        assert!(!md.contains(" as "), "aliasless import must not fabricate `as`: {md}");
+        assert!(
+            !md.contains(" as "),
+            "aliasless import must not fabricate `as`: {md}"
+        );
     }
 
     #[test]
@@ -1191,7 +1371,10 @@ mod tests {
         let d = doc(src);
         let h = hover_at(&d, pos_of(&d, src, "myLib")).expect("hover on alias");
         let md = hover_markdown(&h);
-        assert!(md.contains("@source"), "should mention missing @source: {md}");
+        assert!(
+            md.contains("@source"),
+            "should mention missing @source: {md}"
+        );
     }
 
     #[test]
@@ -1202,7 +1385,10 @@ mod tests {
         let h = hover_at(&d, pos_of(&d, src, "close")).expect("builtin hover");
         let md = hover_markdown(&h);
         assert!(md.contains("close"), "builtin doc unchanged: {md}");
-        assert!(!md.contains("import"), "must be the builtin doc, not an import: {md}");
+        assert!(
+            !md.contains("import"),
+            "must be the builtin doc, not an import: {md}"
+        );
     }
 
     #[test]
@@ -1223,7 +1409,11 @@ mod tests {
             .expect("myLib completion");
         assert_eq!(alias.kind, Some(CompletionItemKind::MODULE));
         assert!(
-            alias.detail.as_deref().unwrap_or("").contains("User/MyLib/1"),
+            alias
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("User/MyLib/1"),
             "detail: {:?}",
             alias.detail
         );
@@ -1243,7 +1433,10 @@ mod tests {
         // The existing post-dot `ta.` member completion still works.
         let d2 = doc("//@version=6\nimport User/MyLib/1 as ta\nx = ta.\n");
         let members = completions_at(&d2, Position::new(2, 7), None);
-        assert!(members.iter().any(|i| i.label == "sma"), "ta.sma still resolves");
+        assert!(
+            members.iter().any(|i| i.label == "sma"),
+            "ta.sma still resolves"
+        );
     }
 
     #[test]
@@ -1255,7 +1448,10 @@ mod tests {
         let src = "//@version=6\nimport User/MyLib/1 as myLib\nx = myLib.\n";
         let d = doc(src);
         let after_dot = completions_at(&d, Position::new(2, 10), None);
-        assert!(after_dot.is_empty(), "no fabricated members for `myLib.` with no path");
+        assert!(
+            after_dot.is_empty(),
+            "no fabricated members for `myLib.` with no path"
+        );
     }
 
     /// The committed fixture-lib directory used as the resolver's `base_dir`,
@@ -1270,7 +1466,8 @@ mod tests {
         // `/// @source math_utils.pine` + `as mu`, cursor after `mu.`, resolved
         // against the committed fixture dir: the lib's EXPORTED fns appear as
         // bare FUNCTION items; the non-exported `helper` does not.
-        let src = "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1 as mu\nx = mu.\n";
+        let src =
+            "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1 as mu\nx = mu.\n";
         let d = doc(src);
         let items = completions_at(&d, Position::new(3, 7), Some(&libs_dir()));
         let add = items
@@ -1278,18 +1475,25 @@ mod tests {
             .find(|i| i.label == "add")
             .expect("exported `add` member");
         assert_eq!(add.kind, Some(CompletionItemKind::FUNCTION));
-        assert!(items.iter().any(|i| i.label == "clamp"), "exported `clamp` member");
+        assert!(
+            items.iter().any(|i| i.label == "clamp"),
+            "exported `clamp` member"
+        );
         assert!(
             !items.iter().any(|i| i.label == "helper"),
             "non-exported `helper` must be absent"
         );
-        assert!(items.iter().all(|i| !i.label.contains('.')), "members are bare");
+        assert!(
+            items.iter().all(|i| !i.label.contains('.')),
+            "members are bare"
+        );
     }
 
     #[test]
     fn completion_after_dot_no_path_degrades() {
         // Same source, but `base_dir = None`: no cross-file members, no panic.
-        let src = "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1 as mu\nx = mu.\n";
+        let src =
+            "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1 as mu\nx = mu.\n";
         let d = doc(src);
         let items = completions_at(&d, Position::new(3, 7), None);
         assert!(
@@ -1328,11 +1532,18 @@ mod tests {
         // Aliasless import: effective_namespace falls back to the lib name
         // (`MathUtils`). Proves the `effective_namespace` match path (NOT
         // `by_alias`, which only matches explicit aliases).
-        let src = "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1\nx = MathUtils.\n";
+        let src =
+            "//@version=6\n/// @source math_utils.pine\nimport User/MathUtils/1\nx = MathUtils.\n";
         let d = doc(src);
         let items = completions_at(&d, Position::new(3, 14), Some(&libs_dir()));
-        assert!(items.iter().any(|i| i.label == "add"), "aliasless `add` resolves");
-        assert!(items.iter().any(|i| i.label == "clamp"), "aliasless `clamp` resolves");
+        assert!(
+            items.iter().any(|i| i.label == "add"),
+            "aliasless `add` resolves"
+        );
+        assert!(
+            items.iter().any(|i| i.label == "clamp"),
+            "aliasless `clamp` resolves"
+        );
     }
 
     #[test]
@@ -1341,7 +1552,10 @@ mod tests {
         // import path does not regress builtin member completion.
         let d = doc("//@version=6\nx = ta.\n");
         let items = completions_at(&d, Position::new(1, 7), Some(&libs_dir()));
-        assert!(items.iter().any(|i| i.label == "sma"), "builtin `ta.sma` still listed");
+        assert!(
+            items.iter().any(|i| i.label == "sma"),
+            "builtin `ta.sma` still listed"
+        );
     }
 
     #[test]
@@ -1352,8 +1566,9 @@ mod tests {
         let d = doc("//@version=6\nindicator(\"x\")\nimport TradingView/ta/7\nplot(close)\n");
         let diags = all_diagnostics(&d);
         assert!(
-            !diags.iter().any(|d| d.code
-                == Some(NumberOrString::String("import-no-source".to_string()))),
+            !diags
+                .iter()
+                .any(|d| d.code == Some(NumberOrString::String("import-no-source".to_string()))),
             "source-less import must not produce a diagnostic"
         );
     }
@@ -1363,7 +1578,9 @@ mod tests {
         let d = doc("//@version=6\nimport User/MyLib/1 as myLib\nx = (1 + \n");
         let diags = all_diagnostics(&d);
         assert!(
-            diags.iter().any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            diags
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
             "syntax ERROR must remain"
         );
     }
@@ -1374,7 +1591,9 @@ mod tests {
         let d = doc("//@version=6\nindicator(\"x\")\nplot(close)\n");
         let items = completions_at(&d, Position::new(3, 0), None);
         assert!(
-            !items.iter().any(|i| i.kind == Some(CompletionItemKind::MODULE)),
+            !items
+                .iter()
+                .any(|i| i.kind == Some(CompletionItemKind::MODULE)),
             "no MODULE items without imports"
         );
     }
@@ -1382,7 +1601,11 @@ mod tests {
     // ---- exported_detail: synthesized signature strings -----------------------
 
     /// Build an `ExportedParam` (name, optional type, defaulted) for tests.
-    fn param(name: &str, type_name: Option<&str>, has_default: bool) -> pine_core::imports::ExportedParam {
+    fn param(
+        name: &str,
+        type_name: Option<&str>,
+        has_default: bool,
+    ) -> pine_core::imports::ExportedParam {
         pine_core::imports::ExportedParam {
             name: name.to_string(),
             type_name: type_name.map(str::to_string),
@@ -1392,7 +1615,11 @@ mod tests {
 
     /// Build an `ExportedSymbol`; the name byte span is irrelevant to
     /// `exported_detail`, so it is left zeroed.
-    fn sym(name: &str, kind: ExportKind, params: Vec<pine_core::imports::ExportedParam>) -> ExportedSymbol {
+    fn sym(
+        name: &str,
+        kind: ExportKind,
+        params: Vec<pine_core::imports::ExportedParam>,
+    ) -> ExportedSymbol {
         ExportedSymbol {
             name: name.to_string(),
             kind,
