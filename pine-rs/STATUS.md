@@ -7,7 +7,7 @@ grammar binding set. Branch: `feat/rust-server`.
 ## Proof (verified)
 
 - **Workspace:** 7 crates — `tree-sitter-pine`, `pine-data-codegen`, `pine-core`,
-  `pine-check`, `pine-lsp`, `pine-cli`, `pine-mcp`. `cargo test` → **59 passing**.
+  `pine-check`, `pine-lsp`, `pine-cli`, `pine-mcp`. `cargo test` → **86 passing**.
 - **Builtins:** 457 functions / 90 variables / 237 constants / 28 keywords,
   embedded from the canonical TS pine-data.
 - **LSP (14 providers, server-verified over stdio):** completion, hover,
@@ -20,7 +20,9 @@ grammar binding set. Branch: `feat/rust-server`.
   missing-argument (data-gated), version, unused-variable. FP-hardened against a
   42-fixture corpus.
 - **Logic-lint (the zelosleone gap, now in Rust):** repainting `lookahead-bias`,
-  `future-leak` (negative history).
+  `future-leak` (negative history), `strategy-no-orders` (Info),
+  `ta-in-conditional` series-consistency (Warning), `constant-condition`
+  literal-`true`/`false` branch (Warning). All FP-scanned against the corpus.
 - **MCP server:** 4 tools over stdio JSON-RPC (validate / lookup / list / format).
 - **Bindings — 7/9 verified:** Rust, C, C++, Python, Go, Swift(build), WASM
   (via web-tree-sitter). Grammar: kvarenzn base + enum, ABI 15.
@@ -35,11 +37,16 @@ grammar binding set. Branch: `feat/rust-server`.
   `missing-argument` is correct but gated by pine-data's `required` flags (only
   28/457 functions mark any param required). Remaining (ternary/logical operand
   types, special-cases) tracked.
-- **Grammar v6 completeness:** 31/42 syntax fixtures parse clean; the residual 11
-  are hard cases (inline-switch-with-tuples — a documented limitation of the
-  original TS parser too — block comments, generics `<T>`, multiline strings,
-  enum member values). Open-ended grammar authoring.
-- **Imports / multi-file IntelliSense** (`/// @source`): not yet ported.
+- **Grammar v6 completeness:** 34/42 syntax fixtures parse clean (block comments,
+  nested generics `<array<float>>`, and enum integer values now fixed). The
+  residual 8 are the hard cases: inline-switch-with-tuples (a documented
+  limitation of the original TS parser too), subscript-vs-tuple,
+  tuple-after-expression, newline-continuation, multiline strings. Open-ended
+  grammar authoring.
+- **Imports / multi-file IntelliSense** (`/// @source`): first slice landed —
+  `pine-core::imports` parses `import user/lib/v as alias` + `/// @source`
+  directives into a typed `ImportTable` (descriptive only, no diagnostics).
+  Cross-file resolution/loading remains.
 
 ## Try it
 
