@@ -7,7 +7,7 @@ grammar binding set. Branch: `feat/rust-server`.
 ## Proof (verified)
 
 - **Workspace:** 7 crates — `tree-sitter-pine`, `pine-data-codegen`, `pine-core`,
-  `pine-check`, `pine-lsp`, `pine-cli`, `pine-mcp`. `cargo test` → **107 passing**.
+  `pine-check`, `pine-lsp`, `pine-cli`, `pine-mcp`. `cargo test` → **128 passing**.
 - **Builtins:** 457 functions / 90 variables / 237 constants / 28 keywords,
   embedded from the canonical TS pine-data.
 - **LSP (14 providers, server-verified over stdio):** completion, hover,
@@ -22,7 +22,8 @@ grammar binding set. Branch: `feat/rust-server`.
 - **Logic-lint (the zelosleone gap, now in Rust):** repainting `lookahead-bias`,
   `future-leak` (negative history), `strategy-no-orders` (Info), `strategy-no-exit`
   (Info), `ta-in-conditional` series-consistency (Warning), `constant-condition`
-  literal-`true`/`false` branch (Warning), `self-assignment` `x := x` (Warning).
+  literal-`true`/`false` branch (Warning), `self-assignment` `x := x` (Warning),
+  `duplicate-parameter` (Error), `redundant-na` `na(na(x))` (Warning).
   All FP-scanned against the corpus.
 - **MCP server:** 4 tools over stdio JSON-RPC (validate / lookup / list / format).
 - **Bindings — 7/9 verified:** Rust, C, C++, Python, Go, Swift(build), WASM
@@ -38,17 +39,19 @@ grammar binding set. Branch: `feat/rust-server`.
   `missing-argument` is correct but gated by pine-data's `required` flags (only
   28/457 functions mark any param required). Remaining (ternary/logical operand
   types, special-cases) tracked.
-- **Grammar v6 completeness:** 34/42 syntax fixtures parse clean (block comments,
-  nested generics `<array<float>>`, and enum integer values now fixed). The
-  residual 8 are the hard cases: leading-operator line-continuation (`?`/`:`/`.`/
-  `and`/`or` at line start) and tuple-vs-subscript (`[a,b] =` after a statement) —
-  both require external-scanner (`scanner.c`) changes on the universal line-break /
-  expression-statement path, which is high regression risk. Deferred to a
-  dedicated scanner increment gated on the full 42-fixture corpus.
-- **Imports / multi-file IntelliSense** (`/// @source`): two slices landed —
-  `pine-core::imports` parses `import user/lib/v as alias` + `/// @source`
-  directives into a typed `ImportTable`, and `pine-lsp` surfaces imported
-  namespaces in hover + completion. Cross-file resolution/loading remains.
+- **Grammar v6 completeness:** 35/42 syntax fixtures parse clean (block comments,
+  nested generics `<array<float>>`, enum integer values, and leading-operator line
+  continuation `?`/`:`/`.` at line start now fixed via the external scanner). The
+  residual 7 are the hardest cases: tuple-vs-subscript (`[a,b] =` after a statement
+  — a GLR conflict needing scanner-gating of `[` to same-line), switch-as-RHS /
+  inline-switch-with-tuples, and indentation edge cases. Higher-risk
+  grammar/conflict work, deferred.
+- **Imports / multi-file IntelliSense** (`/// @source`): three slices landed —
+  `pine-core::imports` parses `import user/lib/v as alias` + `/// @source` into a
+  typed `ImportTable`; `pine-core::resolve_imports` reads local `@source` lib files
+  and extracts their `export`ed symbols (path-traversal-safe, descriptive); and
+  `pine-lsp` surfaces imported namespaces in hover + completion. Wiring the
+  resolved exports into LSP cross-file completion / goto-definition remains.
 
 ## Try it
 
