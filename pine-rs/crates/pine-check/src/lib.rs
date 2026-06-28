@@ -582,6 +582,53 @@ mod tests {
     }
 
     #[test]
+    fn ta_sma_missing_length_is_flagged() {
+        // Mirrors the differential `missing_arg` oracle case: ta.sma(close) omits
+        // the required `length`. The computational-required derive in
+        // pine-data-codegen is what makes this fire.
+        let d = doc("//@version=6\nindicator(\"x\")\nx = ta.sma(close)\nplot(x)\n");
+        assert!(
+            analyze(&d)
+                .iter()
+                .any(|x| x.code == "missing-argument" && x.message.contains("length")),
+            "ta.sma(close) must flag a missing `length` argument"
+        );
+    }
+
+    #[test]
+    fn ta_sma_named_length_not_flagged() {
+        let d = doc("//@version=6\nx = ta.sma(close, length=14)\nplot(x)\n");
+        assert!(!analyze(&d).iter().any(|x| x.code == "missing-argument"));
+    }
+
+    #[test]
+    fn optional_and_overloaded_omission_not_flagged() {
+        // Regression guard against false positives on valid Pine v6:
+        // - input.float(1.0): title/options/etc are optional (non-ta/math namespace).
+        // - plotshape(close): title/text optional (top-level, no namespace).
+        // - ta.change(close): length is an optional tail param.
+        // - ta.tr: bare variable form is not a call node, so never checked.
+        let d = doc(concat!(
+            "//@version=6\n",
+            "indicator(\"x\")\n",
+            "a = input.float(1.0)\n",
+            "plotshape(close)\n",
+            "c = ta.change(close)\n",
+            "t = ta.tr\n",
+            "plot(c + t + a)\n",
+        ));
+        let missing: Vec<_> = analyze(&d)
+            .into_iter()
+            .filter(|x| x.code == "missing-argument")
+            .map(|x| x.message)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "valid Pine must produce no missing-argument: {missing:?}"
+        );
+    }
+
+    #[test]
     fn switch_assignment_target_not_flagged() {
         // `t = switch ...` binds t via variable_definition_statement.
         let d = doc("//@version=6\nt = switch\n    close > open => 1\n    => 0\nplot(t)\n");

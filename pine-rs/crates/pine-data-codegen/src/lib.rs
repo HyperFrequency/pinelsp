@@ -113,8 +113,69 @@ const VARIABLES_JSON: &str = include_str!("../data/variables.json");
 const CONSTANTS_JSON: &str = include_str!("../data/constants.json");
 const KEYWORDS_JSON: &str = include_str!("../data/keywords.json");
 
-pub static FUNCTIONS: LazyLock<Vec<BuiltinFunction>> =
-    LazyLock::new(|| serde_json::from_str(FUNCTIONS_JSON).expect("parse functions.json"));
+pub static FUNCTIONS: LazyLock<Vec<BuiltinFunction>> = LazyLock::new(|| {
+    let mut functions: Vec<BuiltinFunction> =
+        serde_json::from_str(FUNCTIONS_JSON).expect("parse functions.json");
+    derive_computational_required(&mut functions);
+    functions
+});
+
+/// Case-insensitive substrings that mark a parameter description as optional.
+/// Presence of any of these (or an empty description) ends the leading required
+/// run for a computational function. Kept deliberately conservative: a missed
+/// marker only risks a false-positive missing-argument, so the list errs toward
+/// catching every phrasing TradingView uses for "this param has a default".
+const OPTIONAL_MARKERS: [&str; 8] = [
+    "optional",
+    "the default is",
+    "default value",
+    "default is",
+    "if not specified",
+    "defaults to",
+    "if omitted",
+    "not required",
+];
+
+/// Patch missing-required-ness for pure computational builtins.
+///
+/// The upstream scraper only marks a param `required` when its TradingView
+/// description literally contains "required argument", which is absent for
+/// `ta.*`/`math.*` computational functions (e.g. `ta.sma`'s `length` desc is
+/// "Number of bars (length)."). As a result those functions never get a
+/// required param and the missing-argument check can never fire on them.
+///
+/// We repair this AT LOAD TIME (the JSON files stay verbatim, preserving the
+/// `dump-pine-data.mjs` emit contract), scoped ONLY to the `ta` and `math`
+/// namespaces. For each such function we mark the LEADING CONTIGUOUS RUN of
+/// parameters as required, stopping at the first param whose description is
+/// empty or carries an optional marker. We never downgrade a param the JSON
+/// already marked required.
+///
+/// FP safety: the namespace restriction is load-bearing. Inversion-prone
+/// families (`input.*`, `plotshape`, `matrix.sort`, `request.*`, `label.new`,
+/// `line.new`) live outside `ta`/`math` and are untouched. Overloaded
+/// (`unknown`/empty param types) and variadic functions in `ta`/`math` are
+/// still skipped downstream by the checker's existing guards, so even an
+/// over-eager mark here cannot surface a false positive on them.
+fn derive_computational_required(functions: &mut [BuiltinFunction]) {
+    for function in functions.iter_mut() {
+        let is_computational = matches!(function.namespace.as_deref(), Some("ta") | Some("math"));
+        if !is_computational {
+            continue;
+        }
+        for param in function.parameters.iter_mut() {
+            let description = param.description.trim().to_ascii_lowercase();
+            let is_optional = description.is_empty()
+                || OPTIONAL_MARKERS
+                    .iter()
+                    .any(|marker| description.contains(marker));
+            if is_optional {
+                break; // end of the leading required run
+            }
+            param.required = true;
+        }
+    }
+}
 pub static VARIABLES: LazyLock<Vec<BuiltinVariable>> =
     LazyLock::new(|| serde_json::from_str(VARIABLES_JSON).expect("parse variables.json"));
 pub static CONSTANTS: LazyLock<Vec<BuiltinConstant>> =
@@ -207,5 +268,58 @@ mod tests {
     fn keywords_categorized() {
         assert!(is_keyword("if"));
         assert!(!KEYWORDS.declaration.is_empty());
+    }
+
+    fn param<'a>(name: &str, f: &'a BuiltinFunction) -> &'a Param {
+        f.parameters
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("{name} param present on {}", f.name))
+    }
+
+    #[test]
+    fn derive_marks_ta_sma_required_run() {
+        let f = function("ta.sma").expect("ta.sma present");
+        assert!(param("source", f).required, "ta.sma source should be required");
+        assert!(param("length", f).required, "ta.sma length should be required");
+    }
+
+    #[test]
+    fn derive_stops_at_optional_tail() {
+        // ta.change: source required, length optional ("Optional. The default is...").
+        let change = function("ta.change").expect("ta.change present");
+        assert!(param("source", change).required, "ta.change source required");
+        assert!(
+            !param("length", change).required,
+            "ta.change length is optional, must not be marked required"
+        );
+
+        // ta.stdev: source+length required, biased optional ("Optional. The default is true.").
+        let stdev = function("ta.stdev").expect("ta.stdev present");
+        assert!(param("source", stdev).required, "ta.stdev source required");
+        assert!(param("length", stdev).required, "ta.stdev length required");
+        assert!(
+            !param("biased", stdev).required,
+            "ta.stdev biased is optional, must not be marked required"
+        );
+    }
+
+    #[test]
+    fn derive_leaves_other_namespaces_untouched() {
+        let input_float = function("input.float").expect("input.float present");
+        for name in ["title", "options", "minval"] {
+            assert!(
+                !param(name, input_float).required,
+                "input.float {name} must stay optional (non-ta/math namespace)"
+            );
+        }
+
+        let plotshape = function("plotshape").expect("plotshape present");
+        for name in ["title", "text"] {
+            assert!(
+                !param(name, plotshape).required,
+                "plotshape {name} must stay optional (top-level, no namespace)"
+            );
+        }
     }
 }
